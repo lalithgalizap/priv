@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@supabase/auth-helpers-nextjs": "^0.15.0",
+    "@supabase/supabase-js": "^2.106.0",
+    "@tailwindcss/typography": "^0.5.19",
+    "framer-motion": "^12.39.0",
+    "lucide-react": "^1.16.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  }
+}

@@ -1,0 +1,51 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+.npmrc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment / secrets
+.env
+.env.*
+.supabase
+
+
+# Python
+backend/.venv/
+backend/venv/
+backend/Lib/
+backend/Scripts/
+backend/Include/
+backend/pyvenv.cfg
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.python-version
+
+# Logs / coverage
+*.log
+logs/
+coverage/
+.coverage
+nyc_output/
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# Generated data
+*.sqlite3
+*.db
+.cache/

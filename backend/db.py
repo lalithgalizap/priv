@@ -1,0 +1,1445 @@
+import logging
+import os
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
+import psycopg2
+from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
+
+load_dotenv()
+
+logger = logging.getLogger("db")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+
+# Credit rates per 1K tokens (integer credits, 1 credit ≈ $0.01)
+MODEL_CREDIT_RATES = {
+    # OpenAI models
+    "gpt-4o-mini": {"input": 2, "output": 6},
+    "gpt-4o": {"input": 25, "output": 100},
+    # Anthropic Claude models (AWS Bedrock)
+    "anthropic.claude-3-sonnet-20240229-v1:0": {"input": 30, "output": 150},
+    "claude-3-5-sonnet": {"input": 30, "output": 150},
+    "anthropic.claude-3-haiku-20240307-v1:0": {"input": 4, "output": 15},
+    "anthropic.claude-3-opus-20240229-v1:0": {"input": 150, "output": 750},
+    "claude-3-opus": {"input": 150, "output": 750},
+    # Meta Llama models (AWS Bedrock)
+    "meta.llama3-70b-instruct-v1:0": {"input": 10, "output": 30},
+    # Mistral models (AWS Bedrock)
+    "mistral.mistral-large-2402-v1:0": {"input": 20, "output": 60},
+    # Amazon Titan models (AWS Bedrock)
+    "amazon.titan-text-premier-v1:0": {"input": 4, "output": 12},
+    # Moonshot AI models (AWS Bedrock)
+    "moonshotai.kimi-k2.5": {"input": 8, "output": 24},
+}
+DEFAULT_CREDIT_RATE = {"input": 25, "output": 100}  # fallback to mid-tier model rates
+
+
+def calculate_request_credits(model_identifier: str, input_tokens: int, output_tokens: int) -> int:
+    """Convert actual token usage to credits based on model pricing."""
+    rates = MODEL_CREDIT_RATES.get(model_identifier, DEFAULT_CREDIT_RATE)
+    input_credits = (input_tokens / 1000) * rates["input"]
+    output_credits = (output_tokens / 1000) * rates["output"]
+    return max(1, int(input_credits + output_credits))  # at least 1 credit per request
+
+
+def estimate_request_credits(model_identifier: str, estimated_input_tokens: int, estimated_output_tokens: int) -> int:
+    """Pre-flight estimate of request cost in credits."""
+    return calculate_request_credits(model_identifier, estimated_input_tokens, estimated_output_tokens)
+
+_pool: Optional[SimpleConnectionPool] = None
+
+
+def get_pool() -> SimpleConnectionPool:
+    global _pool
+    if _pool is None and DATABASE_URL:
+        _pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=DATABASE_URL,
+            sslmode="require",
+        )
+    return _pool
+
+
+@contextmanager
+def get_db():
+    pool = get_pool()
+    if pool is None:
+        raise RuntimeError("Database not configured")
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        # Always rollback to ensure connection is returned in a clean state.
+        # If the caller committed successfully, rollback is a no-op.
+        # If the transaction was aborted, this resets it so the next user
+        # gets a fresh, usable connection.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        pool.putconn(conn)
+
+
+def init_db():
+    """Initialize database tables if they don't exist.
+
+    Each DDL statement is executed separately so one failure does not
+    poison the entire initialization.
+    """
+    statements = [
+        'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"',
+        """
+        CREATE TABLE IF NOT EXISTS tenants (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            company_name VARCHAR(255) NOT NULL UNIQUE,
+            tier VARCHAR(50) DEFAULT 'free',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            supabase_auth_id UUID UNIQUE NOT NULL,
+            tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+            display_name VARCHAR(150),
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS tenant_usage_metrics (
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+            supabase_auth_id UUID NOT NULL,
+            model_identifier VARCHAR(150) NOT NULL,
+            input_tokens_used BIGINT DEFAULT 0,
+            output_tokens_used BIGINT DEFAULT 0,
+            total_tokens_used BIGINT DEFAULT 0,
+            execution_duration_ms BIGINT DEFAULT 0,
+            credits_used BIGINT DEFAULT 0,
+            api_call_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        'CREATE INDEX IF NOT EXISTS idx_metrics_tenant_date ON tenant_usage_metrics (tenant_id, api_call_timestamp DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_metrics_user ON tenant_usage_metrics (supabase_auth_id)',
+    ]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            for stmt in statements:
+                try:
+                    cur.execute(stmt)
+                except psycopg2.Error as e:
+                    # Log but continue; many errors are benign (e.g. extension
+                    # already exists, table already exists, index already exists).
+                    logger.debug("DDL statement skipped: %s", e)
+        conn.commit()
+
+
+def ensure_default_tenant() -> bool:
+    """Ensure the fallback default tenant exists and discover its actual UUID.
+
+    If 'Default Corp' already exists with a different auto-generated ID
+    (and has metrics referencing it), we adopt that ID as the default
+    rather than forcing the hardcoded UUID.
+    Safe to call multiple times.
+    """
+    global DEFAULT_TENANT_ID
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # 1. Check if Default Corp already exists
+                cur.execute("SELECT id FROM tenants WHERE company_name = 'Default Corp'")
+                row = cur.fetchone()
+                if row:
+                    existing_id = str(row[0])
+                    if existing_id != DEFAULT_TENANT_ID:
+                        # Check if metrics reference the existing row
+                        cur.execute(
+                            "SELECT COUNT(*) FROM tenant_usage_metrics WHERE tenant_id = %s",
+                            (existing_id,),
+                        )
+                        metric_count = int(cur.fetchone()[0])
+                        if metric_count > 0:
+                            logger.info(
+                                "Adopting existing Default Corp tenant %s (has %d metrics)",
+                                existing_id, metric_count,
+                            )
+                            DEFAULT_TENANT_ID = existing_id
+                        else:
+                            # No metrics: safe to update to fixed UUID
+                            cur.execute(
+                                "UPDATE tenants SET id = %s WHERE company_name = 'Default Corp'",
+                                (DEFAULT_TENANT_ID,),
+                            )
+                            conn.commit()
+                            logger.info("Updated Default Corp tenant to fixed UUID %s", DEFAULT_TENANT_ID)
+                    return True
+
+                # 2. Insert with fixed UUID if no Default Corp exists
+                cur.execute(
+                    """
+                    INSERT INTO tenants (id, company_name, tier)
+                    VALUES (%s, 'Default Corp', 'free')
+                    """,
+                    (DEFAULT_TENANT_ID,),
+                )
+                conn.commit()
+                logger.info("Created default tenant with UUID %s", DEFAULT_TENANT_ID)
+        return True
+    except psycopg2.Error as e:
+        logger.warning("Could not ensure default tenant: %s", e)
+        return False
+
+
+def save_usage_metric(
+    tenant_id: str,
+    supabase_auth_id: str,
+    model_identifier: str,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+    duration_ms: int,
+    credits_used: int,
+) -> None:
+    """Persist a usage metric row.  FK failures are caught and logged
+    so that a missing tenant never blocks the AI response from reaching
+    the user."""
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO tenant_usage_metrics
+                    (tenant_id, supabase_auth_id, model_identifier,
+                     input_tokens_used, output_tokens_used, total_tokens_used,
+                     execution_duration_ms, credits_used)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (tenant_id, supabase_auth_id, model_identifier,
+                     input_tokens, output_tokens, total_tokens, duration_ms, credits_used),
+                )
+            conn.commit()
+    except psycopg2.Error as e:
+        logger.warning("Failed to persist usage metric: %s", e)
+
+
+def get_analytics(tenant_id: str):
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Total tokens
+            cur.execute(
+                "SELECT COALESCE(SUM(total_tokens_used), 0) as total FROM tenant_usage_metrics WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            row = cur.fetchone()
+            total_tokens = int(row["total"]) if row else 0
+
+            # Recent logs
+            cur.execute(
+                """
+                SELECT tenant_id, model_identifier, input_tokens_used as input_tokens,
+                       total_tokens_used as total_tokens,
+                       execution_duration_ms as duration_ms,
+                       api_call_timestamp as timestamp,
+                       CASE WHEN execution_duration_ms > 500 THEN 'error' ELSE 'success' END as status
+                FROM tenant_usage_metrics
+                WHERE tenant_id = %s
+                ORDER BY api_call_timestamp DESC
+                LIMIT 50
+                """,
+                (tenant_id,),
+            )
+            logs = [dict(row) for row in cur.fetchall()]
+
+            # Token trend: last 7 days grouped by day
+            cur.execute(
+                """
+                SELECT DATE(api_call_timestamp) as day,
+                       COALESCE(SUM(total_tokens_used), 0) as tokens
+                FROM tenant_usage_metrics
+                WHERE tenant_id = %s AND api_call_timestamp >= NOW() - INTERVAL '7 days'
+                GROUP BY DATE(api_call_timestamp)
+                ORDER BY day ASC
+                """,
+                (tenant_id,),
+            )
+            trend_rows = cur.fetchall()
+            # Build 7-day array with 0s for missing days
+            from datetime import date, timedelta
+            today = date.today()
+            token_trend = []
+            trend_map = {str(r["day"]): int(r["tokens"]) for r in trend_rows}
+            for i in range(6, -1, -1):
+                day = today - timedelta(days=i)
+                token_trend.append(trend_map.get(str(day), 0))
+
+            # Model breakdown
+            cur.execute(
+                """
+                SELECT model_identifier,
+                       COALESCE(SUM(total_tokens_used), 0) as tokens,
+                       COUNT(*) as calls
+                FROM tenant_usage_metrics
+                WHERE tenant_id = %s
+                GROUP BY model_identifier
+                ORDER BY tokens DESC
+                """,
+                (tenant_id,),
+            )
+            model_breakdown = [dict(row) for row in cur.fetchall()]
+
+            # Active tenants count
+            cur.execute("SELECT COUNT(*) as cnt FROM tenants WHERE is_active = TRUE")
+            row = cur.fetchone()
+            active_tenants = int(row["cnt"]) if row else 0
+
+    return {
+        "total_tokens": total_tokens,
+        "active_tenants": max(active_tenants, 1),
+        "compute_cost": round(total_tokens * 0.002 / 1000, 2),
+        "logs": logs,
+        "token_trend": token_trend,
+        "model_breakdown": model_breakdown,
+    }
+
+
+# ── Role & Profile helpers ──────────────────────────────────────────
+
+def get_user_role(supabase_auth_id: str) -> str:
+    """Fetch role for a given Supabase auth user ID. Returns 'member' as default."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT role FROM user_profiles WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            row = cur.fetchone()
+            return row["role"] if row else "member"
+
+
+# ── API Key management ──────────────────────────────────────────────
+
+import secrets
+import hashlib
+
+
+def _hash_key(raw_key: str) -> str:
+    """SHA-256 hash of an API key for storage comparison."""
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+def create_api_key(tenant_id: str, created_by: str, name: str, scopes: list[str] | None = None, expires_days: int | None = None) -> tuple[str, str]:
+    """Generate a new API key. Returns (raw_key, key_id)."""
+    raw_key = "ak_" + secrets.token_urlsafe(32)
+    key_hash = _hash_key(raw_key)
+    key_preview = raw_key[:6] + "..." + raw_key[-4:]
+
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            expires = None
+            if expires_days:
+                from datetime import datetime, timedelta
+                expires = datetime.utcnow() + timedelta(days=expires_days)
+            scope_json = scopes if scopes else ["mediate", "analytics"]
+            cur.execute(
+                """
+                INSERT INTO api_keys (tenant_id, created_by, name, key_hash, key_preview, scopes, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (tenant_id, created_by, name, key_hash, key_preview, json.dumps(scope_json), expires),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return raw_key, str(row["id"])
+
+
+import json
+
+
+def list_api_keys(tenant_id: str) -> list[dict]:
+    """Return all active API keys for a tenant (without key_hash)."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, name, key_preview, scopes, expires_at, is_active, last_used_at, created_at
+                FROM api_keys
+                WHERE tenant_id = %s AND is_active = TRUE
+                ORDER BY created_at DESC
+                """,
+                (tenant_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
+def revoke_api_key(key_id: str, tenant_id: str) -> bool:
+    """Soft-delete (deactivate) an API key. Returns True if a row was updated."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE api_keys SET is_active = FALSE WHERE id = %s AND tenant_id = %s",
+                (key_id, tenant_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def validate_api_key(raw_key: str) -> dict | None:
+    """Validate a raw API key. Returns key metadata or None if invalid/expired."""
+    if not raw_key or not raw_key.startswith("ak_"):
+        return None
+    key_hash = _hash_key(raw_key)
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, tenant_id, name, scopes, expires_at, is_active
+                FROM api_keys
+                WHERE key_hash = %s AND is_active = TRUE
+                """,
+                (key_hash,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            if row["expires_at"] and row["expires_at"] < __import__("datetime").datetime.utcnow():
+                return None
+            # Update last_used_at
+            cur.execute(
+                "UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (row["id"],),
+            )
+            conn.commit()
+            return dict(row)
+
+
+# ── Org Management ──────────────────────────────────────────────────
+
+def list_org_members(tenant_id: str) -> list[dict]:
+    """Return all user_profiles for a given tenant."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, supabase_auth_id, display_name, role, created_at
+                FROM user_profiles
+                WHERE tenant_id = %s
+                ORDER BY
+                  CASE role
+                    WHEN 'leader' THEN 1
+                    WHEN 'member' THEN 2
+                  END,
+                  created_at DESC
+                """,
+                (tenant_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def update_member_role(tenant_id: str, profile_id: str, new_role: str) -> bool:
+    """Update a member's role. Leaders can only set member. Returns True if updated."""
+    if new_role not in ("leader", "member"):
+        raise ValueError("Invalid role.")
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE user_profiles SET role = %s WHERE id = %s AND tenant_id = %s",
+                (new_role, profile_id, tenant_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def remove_org_member(tenant_id: str, profile_id: str) -> bool:
+    """Remove a member from an org. Cannot remove the last leader."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Count remaining leaders
+            cur.execute(
+                "SELECT COUNT(*) as cnt FROM user_profiles WHERE tenant_id = %s AND role = 'leader'",
+                (tenant_id,),
+            )
+            leader_count = int(cur.fetchone()["cnt"])
+            # Check if target is a leader
+            cur.execute(
+                "SELECT role FROM user_profiles WHERE id = %s AND tenant_id = %s",
+                (profile_id, tenant_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            if row["role"] == "leader" and leader_count <= 1:
+                raise ValueError("Cannot remove the last leader. Contact superadmin.")
+            cur.execute(
+                "DELETE FROM user_profiles WHERE id = %s AND tenant_id = %s",
+                (profile_id, tenant_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def get_profile_id_by_auth(supabase_auth_id: str) -> str | None:
+    """Get user_profiles.id from supabase_auth_id."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id FROM user_profiles WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            row = cur.fetchone()
+            return str(row["id"]) if row else None
+
+
+def create_invite(tenant_id: str, email: str, role: str, invited_by_auth_id: str) -> tuple[str, str]:
+    """Create a tenant invite token. Looks up profile id from auth id. Returns (token, invite_id)."""
+    profile_id = get_profile_id_by_auth(invited_by_auth_id)
+    if not profile_id:
+        raise ValueError("Inviter profile not found.")
+    token = "inv_" + __import__("secrets").token_urlsafe(24)
+    from datetime import datetime, timedelta
+    expires = datetime.utcnow() + timedelta(days=7)
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO tenant_invites (tenant_id, email, role, invited_by, token, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (tenant_id, email.lower().strip(), role, profile_id, token, expires),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return token, str(row["id"])
+
+
+def list_invites(tenant_id: str) -> list[dict]:
+    """Return pending (unused, unexpired) invites for a tenant."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT i.id, i.email, i.role, i.token, i.expires_at, i.created_at,
+                       p.display_name as invited_by_name
+                FROM tenant_invites i
+                LEFT JOIN user_profiles p ON p.id = i.invited_by
+                WHERE i.tenant_id = %s
+                  AND i.used_at IS NULL
+                  AND (i.expires_at IS NULL OR i.expires_at > CURRENT_TIMESTAMP)
+                ORDER BY i.created_at DESC
+                """,
+                (tenant_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def revoke_invite(invite_id: str, tenant_id: str) -> bool:
+    """Mark an invite as used (soft revoke)."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE tenant_invites SET used_at = CURRENT_TIMESTAMP WHERE id = %s AND tenant_id = %s",
+                (invite_id, tenant_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def validate_invite_token(token: str) -> dict | None:
+    """Check if an invite token is valid and unused. Returns invite details or None."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT i.id, i.tenant_id, i.email, i.role, i.expires_at,
+                       t.company_name as tenant_name
+                FROM tenant_invites i
+                JOIN tenants t ON t.id = i.tenant_id
+                WHERE i.token = %s
+                  AND i.used_at IS NULL
+                  AND (i.expires_at IS NULL OR i.expires_at > CURRENT_TIMESTAMP)
+                """,
+                (token,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def accept_invite(token: str, supabase_auth_id: str, display_name: str) -> dict | None:
+    """Redeem an invite: create/update user profile with correct tenant/role, mark invite used."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Get invite
+            cur.execute(
+                """
+                SELECT id, tenant_id, email, role FROM tenant_invites
+                WHERE token = %s AND used_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                """,
+                (token,),
+            )
+            invite = cur.fetchone()
+            if not invite:
+                return None
+
+            tenant_id = str(invite["tenant_id"])
+            role = invite["role"]
+
+            # Upsert user profile
+            cur.execute(
+                "SELECT id FROM user_profiles WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE user_profiles
+                    SET tenant_id = %s, role = %s, display_name = %s
+                    WHERE supabase_auth_id = %s
+                    """,
+                    (tenant_id, role, display_name, supabase_auth_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO user_profiles (supabase_auth_id, tenant_id, display_name, role, is_platform_admin)
+                    VALUES (%s, %s, %s, %s, FALSE)
+                    """,
+                    (supabase_auth_id, tenant_id, display_name, role),
+                )
+
+            # Mark invite as used
+            cur.execute(
+                "UPDATE tenant_invites SET used_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (str(invite["id"]),),
+            )
+            conn.commit()
+            return {"tenant_id": tenant_id, "role": role, "email": invite["email"]}
+
+
+def ensure_user_profile(supabase_auth_id: str, email: str, tenant_id: str | None = None) -> dict:
+    """Ensure a user profile exists. Create with defaults if missing. Returns profile."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, tenant_id, display_name, role, is_platform_admin FROM user_profiles WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            # Create new profile with default tenant
+            tid = tenant_id if tenant_id else DEFAULT_TENANT_ID
+            cur.execute(
+                """
+                INSERT INTO user_profiles (supabase_auth_id, tenant_id, display_name, role, is_platform_admin)
+                VALUES (%s, %s, %s, %s, FALSE)
+                RETURNING id, tenant_id, display_name, role, is_platform_admin
+                """,
+                (supabase_auth_id, tid, email, "member"),
+            )
+            new = cur.fetchone()
+            conn.commit()
+            return dict(new)
+
+
+def get_org_usage(tenant_id: str) -> dict:
+    """Return aggregate usage for a tenant."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(total_tokens_used), 0) as total_tokens FROM tenant_usage_metrics WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            raw_total = int(cur.fetchone()["total_tokens"])
+            total_tokens = raw_total
+            cur.execute(
+                "SELECT COUNT(DISTINCT supabase_auth_id) as active_users FROM tenant_usage_metrics WHERE tenant_id = %s AND api_call_timestamp > CURRENT_TIMESTAMP - INTERVAL '30 days'",
+                (tenant_id,),
+            )
+            active_users = int(cur.fetchone()["active_users"])
+            cur.execute(
+                "SELECT COUNT(*) as total_calls FROM tenant_usage_metrics WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            total_calls = int(cur.fetchone()["total_calls"])
+            cur.execute(
+                """
+                SELECT model_identifier, SUM(total_tokens_used) as tokens, COUNT(*) as calls
+                FROM tenant_usage_metrics
+                WHERE tenant_id = %s
+                GROUP BY model_identifier
+                ORDER BY tokens DESC
+                """,
+                (tenant_id,),
+            )
+            model_breakdown = [dict(r) for r in cur.fetchall()]
+            return {
+                "total_tokens": total_tokens,
+                "active_users": active_users,
+                "total_calls": total_calls,
+                "compute_cost": round(total_tokens * 0.002 / 1000, 2),
+                "model_breakdown": model_breakdown,
+            }
+
+
+def get_user_usage(supabase_auth_id: str) -> dict:
+    """Return usage stats for a single user."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(total_tokens_used), 0) as total_tokens FROM tenant_usage_metrics WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            total_tokens = int(cur.fetchone()["total_tokens"])
+            cur.execute(
+                "SELECT COUNT(*) as total_calls FROM tenant_usage_metrics WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            total_calls = int(cur.fetchone()["total_calls"])
+            cur.execute(
+                """
+                SELECT model_identifier, SUM(total_tokens_used) as tokens, COUNT(*) as calls
+                FROM tenant_usage_metrics
+                WHERE supabase_auth_id = %s
+                GROUP BY model_identifier
+                ORDER BY tokens DESC
+                """,
+                (supabase_auth_id,),
+            )
+            model_breakdown = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT tenant_id, model_identifier, total_tokens_used as tokens,
+                       execution_duration_ms as duration_ms,
+                       api_call_timestamp as timestamp
+                FROM tenant_usage_metrics
+                WHERE supabase_auth_id = %s
+                ORDER BY api_call_timestamp DESC
+                LIMIT 20
+                """,
+                (supabase_auth_id,),
+            )
+            recent = [dict(r) for r in cur.fetchall()]
+            return {
+                "total_tokens": total_tokens,
+                "total_calls": total_calls,
+                "compute_cost": round(total_tokens * 0.002 / 1000, 2),
+                "model_breakdown": model_breakdown,
+                "recent": recent,
+            }
+
+
+def get_global_usage() -> dict:
+    """Return aggregate usage across all tenants (superadmin view)."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(total_tokens_used), 0) as total_tokens FROM tenant_usage_metrics"
+            )
+            total_tokens = int(cur.fetchone()["total_tokens"])
+            cur.execute(
+                "SELECT COUNT(*) as total_calls FROM tenant_usage_metrics"
+            )
+            total_calls = int(cur.fetchone()["total_calls"])
+            cur.execute(
+                "SELECT COUNT(DISTINCT tenant_id) as active_tenants FROM tenant_usage_metrics"
+            )
+            active_tenants = int(cur.fetchone()["active_tenants"])
+            cur.execute(
+                "SELECT COUNT(*) as total_users FROM user_profiles"
+            )
+            total_users = int(cur.fetchone()["total_users"])
+            cur.execute(
+                """
+                SELECT t.company_name, SUM(m.total_tokens_used) as tokens, COUNT(*) as calls
+                FROM tenant_usage_metrics m
+                JOIN tenants t ON t.id = m.tenant_id
+                GROUP BY t.company_name
+                ORDER BY tokens DESC
+                LIMIT 20
+                """
+            )
+            tenant_breakdown = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT model_identifier, SUM(total_tokens_used) as tokens, COUNT(*) as calls
+                FROM tenant_usage_metrics
+                GROUP BY model_identifier
+                ORDER BY tokens DESC
+                """
+            )
+            model_breakdown = [dict(r) for r in cur.fetchall()]
+            return {
+                "total_tokens": total_tokens,
+                "total_calls": total_calls,
+                "active_tenants": active_tenants,
+                "total_users": total_users,
+                "compute_cost": round(total_tokens * 0.002 / 1000, 2),
+                "tenant_breakdown": tenant_breakdown,
+                "model_breakdown": model_breakdown,
+            }
+
+
+def is_platform_admin(supabase_auth_id: str) -> bool:
+    """Check if a user is a platform-level superadmin."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT is_platform_admin FROM user_profiles WHERE supabase_auth_id = %s",
+                (supabase_auth_id,),
+            )
+            row = cur.fetchone()
+            return bool(row and row.get("is_platform_admin"))
+
+
+def list_all_tenants() -> list[dict]:
+    """Return all tenants with member count (superadmin only)."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT t.id,
+                       t.company_name,
+                       t.tier,
+                       t.is_active,
+                       t.created_at,
+                       COALESCE(t.extra_token_pool, 0) as extra_token_pool,
+                       COALESCE((SELECT COUNT(*) FROM user_profiles WHERE tenant_id = t.id), 0) as member_count,
+                       COALESCE((SELECT SUM(total_tokens_used) FROM tenant_usage_metrics WHERE tenant_id = t.id), 0) as total_tokens,
+                       COALESCE(t.paid_credit_used, 0) as paid_credit_used
+                FROM tenants t
+                ORDER BY t.created_at DESC
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_tenant_details(tenant_id: str) -> dict | None:
+    """Get tenant info + members + usage."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id,
+                       company_name,
+                       tier,
+                       is_active,
+                       created_at,
+                       COALESCE(extra_token_pool, 0) as extra_token_pool
+                FROM tenants WHERE id = %s
+                """,
+                (tenant_id,),
+            )
+            tenant = cur.fetchone()
+            if not tenant:
+                return None
+            members = list_org_members(tenant_id)
+            usage = get_org_usage(tenant_id)
+            usage_detail = get_tenant_usage_detail(tenant_id)
+            return {
+                "tenant": dict(tenant),
+                "members": members,
+                "usage": usage,
+                "usage_detail": usage_detail,
+            }
+
+
+def get_tenant_usage_detail(tenant_id: str, days: int = 30) -> dict:
+    """Detailed credit usage per tenant for billing dashboards."""
+    since = datetime.now(timezone.utc) - timedelta(days=days - 1)
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT DATE(api_call_timestamp) as day,
+                       COALESCE(SUM(credits_used), 0) as credits,
+                       COALESCE(SUM(total_tokens_used), 0) as tokens
+                FROM tenant_usage_metrics
+                WHERE tenant_id = %s AND api_call_timestamp >= %s
+                GROUP BY DATE(api_call_timestamp)
+                ORDER BY day ASC
+                """,
+                (tenant_id, since),
+            )
+            daily_rows = [
+                {
+                    "day": row["day"].isoformat(),
+                    "credits": int(row["credits"] or 0),
+                    "tokens": int(row["tokens"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+            cur.execute(
+                """
+                SELECT u.supabase_auth_id,
+                       u.display_name,
+                       u.role,
+                       u.created_at,
+                       COALESCE(SUM(m.credits_used), 0) as total_credits,
+                       COALESCE(SUM(m.total_tokens_used), 0) as total_tokens,
+                       COALESCE(MAX(m.api_call_timestamp), u.created_at) as last_activity
+                FROM user_profiles u
+                LEFT JOIN tenant_usage_metrics m ON m.supabase_auth_id = u.supabase_auth_id
+                WHERE u.tenant_id = %s
+                GROUP BY u.supabase_auth_id, u.display_name, u.role, u.created_at
+                ORDER BY total_credits DESC, u.created_at DESC
+                """,
+                (tenant_id,),
+            )
+            member_rows = [
+                {
+                    "supabase_auth_id": str(row["supabase_auth_id"]),
+                    "display_name": row.get("display_name"),
+                    "role": row.get("role", "member"),
+                    "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+                    "total_credits": int(row["total_credits"] or 0),
+                    "total_tokens": int(row["total_tokens"] or 0),
+                    "last_activity": row["last_activity"].isoformat() if row.get("last_activity") else None,
+                }
+                for row in cur.fetchall()
+            ]
+
+            cur.execute(
+                """
+                SELECT supabase_auth_id,
+                       DATE(api_call_timestamp) as day,
+                       COALESCE(SUM(credits_used), 0) as credits
+                FROM tenant_usage_metrics
+                WHERE tenant_id = %s AND api_call_timestamp >= %s
+                GROUP BY supabase_auth_id, DATE(api_call_timestamp)
+                ORDER BY day DESC
+                """,
+                (tenant_id, since),
+            )
+            member_daily = [
+                {
+                    "supabase_auth_id": str(row["supabase_auth_id"]),
+                    "day": row["day"].isoformat(),
+                    "credits": int(row["credits"] or 0),
+                }
+                for row in cur.fetchall()
+            ]
+
+            return {
+                "daily": daily_rows,
+                "members": member_rows,
+                "member_daily": member_daily,
+            }
+
+
+# ── Admin (Superadmin) Management ───────────────────────────────────
+
+def create_tenant(company_name: str, tier: str = "standard") -> str:
+    """Create a new tenant (company). Returns tenant_id."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "INSERT INTO tenants (company_name, tier, is_active) VALUES (%s, %s, TRUE) RETURNING id",
+                (company_name, tier),
+            )
+            tenant_id = str(cur.fetchone()["id"])
+            conn.commit()
+            return tenant_id
+
+
+def get_user_profile(profile_id: str) -> dict | None:
+    """Get a single user profile by id."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, supabase_auth_id, tenant_id, display_name, role,
+                       is_platform_admin, created_at
+                FROM user_profiles WHERE id = %s
+                """,
+                (profile_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def update_any_user_role(profile_id: str, new_role: str) -> bool:
+    """Superadmin can change any user's role globally."""
+    if new_role not in ("superadmin", "leader", "member"):
+        raise ValueError("Invalid role.")
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            is_admin = new_role == "superadmin"
+            cur.execute(
+                "UPDATE user_profiles SET role = %s, is_platform_admin = %s WHERE id = %s",
+                (new_role, is_admin, profile_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def delete_any_user(profile_id: str) -> bool:
+    """Superadmin can delete any user globally."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("DELETE FROM user_profiles WHERE id = %s", (profile_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def list_all_users() -> list[dict]:
+    """Return all users across all companies with tenant name."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT p.id, p.supabase_auth_id, p.display_name, p.role,
+                       p.is_platform_admin, p.created_at,
+                       t.company_name as tenant_name
+                FROM user_profiles p
+                LEFT JOIN tenants t ON t.id = p.tenant_id
+                ORDER BY p.created_at DESC
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def assign_leader_to_tenant(tenant_id: str, email: str, invited_by: str) -> tuple[str, str]:
+    """Invite someone to become the leader of a company. Returns (token, invite_id)."""
+    return create_invite(tenant_id, email, "leader", invited_by)
+
+
+# ── Chat Sessions (per-user, stored in DB) ───────────────────────
+
+def create_chat_session(supabase_auth_id: str, title: str, model_id: str) -> dict:
+    """Create a new chat session for a user."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO chat_sessions (supabase_auth_id, title, model_id)
+                VALUES (%s, %s, %s)
+                RETURNING id, title, model_id, created_at, updated_at
+                """,
+                (supabase_auth_id, title, model_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return dict(row)
+
+
+def list_chat_sessions(supabase_auth_id: str) -> list[dict]:
+    """List all chat sessions for a user, newest first."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, title, model_id, created_at, updated_at
+                FROM chat_sessions
+                WHERE supabase_auth_id = %s
+                ORDER BY updated_at DESC
+                """,
+                (supabase_auth_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_chat_session(session_id: str, supabase_auth_id: str) -> dict | None:
+    """Get a single session with its messages. Verifies ownership."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, title, model_id, created_at, updated_at
+                FROM chat_sessions
+                WHERE id = %s AND supabase_auth_id = %s
+                """,
+                (session_id, supabase_auth_id),
+            )
+            session = cur.fetchone()
+            if not session:
+                return None
+            cur.execute(
+                """
+                SELECT id, role, content, created_at
+                FROM chat_messages
+                WHERE session_id = %s
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            )
+            messages = [dict(r) for r in cur.fetchall()]
+            return {**dict(session), "messages": messages}
+
+
+def add_chat_message(session_id: str, role: str, content: str, supabase_auth_id: str) -> dict | None:
+    """Add a message to a session. Verifies ownership. Returns the message."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Verify ownership
+            cur.execute(
+                "SELECT id FROM chat_sessions WHERE id = %s AND supabase_auth_id = %s",
+                (session_id, supabase_auth_id),
+            )
+            if not cur.fetchone():
+                return None
+            cur.execute(
+                """
+                INSERT INTO chat_messages (session_id, role, content)
+                VALUES (%s, %s, %s)
+                RETURNING id, role, content, created_at
+                """,
+                (session_id, role, content),
+            )
+            msg = cur.fetchone()
+            # Update session updated_at
+            cur.execute(
+                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (session_id,),
+            )
+            conn.commit()
+            return dict(msg)
+
+
+def delete_chat_session(session_id: str, supabase_auth_id: str) -> bool:
+    """Delete a session and all its messages. Verifies ownership."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "DELETE FROM chat_sessions WHERE id = %s AND supabase_auth_id = %s",
+                (session_id, supabase_auth_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+def update_chat_session_title(session_id: str, supabase_auth_id: str, title: str) -> bool:
+    """Rename a session. Verifies ownership."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE chat_sessions SET title = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND supabase_auth_id = %s
+                """,
+                (title, session_id, supabase_auth_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+
+# ── Token Quota Management ────────────────────────────────────────
+
+def _maybe_reset_daily_tokens(cur, supabase_auth_id: str) -> tuple[int, int, int, int]:
+    """Check if daily reset is needed and return current state.
+    Returns (daily_budget, daily_used, extra_allocated, extra_used)."""
+    cur.execute(
+        "SELECT daily_budget, daily_used, last_token_reset, paid_credit_balance, paid_credit_used FROM user_profiles WHERE supabase_auth_id = %s",
+        (supabase_auth_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return 50, 0, 0, 0
+
+    daily_budget = int(row[0] or 50)
+    daily_used = int(row[1] or 0)
+    last_reset = row[2]
+    extra_allocated = int(row[3] or 0) if row[3] is not None else 0
+    extra_used = int(row[4] or 0) if row[4] is not None else 0
+
+    now = datetime.now(timezone.utc)
+    if last_reset and last_reset.date() < now.date():
+        # Daily reset: clear daily_used
+        cur.execute(
+            "UPDATE user_profiles SET daily_used = 0, last_token_reset = %s WHERE supabase_auth_id = %s",
+            (now, supabase_auth_id),
+        )
+        daily_used = 0
+
+    return daily_budget, daily_used, extra_allocated, extra_used
+
+
+def _warning_level(daily_budget: int, daily_used: int) -> str:
+    """Return usage warning level based on daily budget consumption."""
+    if daily_budget <= 0:
+        return "exhausted"
+    pct = daily_used / daily_budget
+    if pct < 0.7:
+        return "none"
+    if pct < 0.9:
+        return "caution"
+    if pct < 1.0:
+        return "warning"
+    if pct < 1.1:
+        return "critical"
+    return "exhausted"
+
+
+def get_user_token_usage(supabase_auth_id: str) -> dict:
+    """Return user's daily budget and extra credit status."""
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            daily_budget, daily_used, extra_allocated, extra_used = _maybe_reset_daily_tokens(cur, supabase_auth_id)
+            conn.commit()
+
+    daily_remaining = max(daily_budget - daily_used, 0)
+    extra_remaining = max(extra_allocated - extra_used, 0)
+    total_available = daily_remaining + extra_remaining
+
+    return {
+        "daily_budget": daily_budget,
+        "daily_used": daily_used,
+        "daily_remaining": daily_remaining,
+        "extra_allocated": extra_allocated,
+        "extra_used": extra_used,
+        "extra_remaining": extra_remaining,
+        "total_available": total_available,
+        "warning_level": _warning_level(daily_budget, daily_used),
+    }
+
+
+def get_org_token_usage(tenant_id: str) -> dict:
+    """Return org's extra credit pool status."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COALESCE(extra_token_pool, 0) as pool FROM tenants WHERE id = %s", (tenant_id,))
+            row = cur.fetchone()
+            pool = int(row["pool"] if row else 0)
+            # Sum of extra allocated to members (stored in paid_credit_balance column as credits)
+            cur.execute(
+                "SELECT COALESCE(SUM(paid_credit_balance), 0) as allocated FROM user_profiles WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            allocated_row = cur.fetchone()
+            allocated = int(allocated_row["allocated"] if allocated_row else 0)
+            return {"extra_pool": pool, "extra_allocated": allocated}
+
+
+def get_org_quota_snapshot(tenant_id: str) -> dict:
+    """Return org pool plus each member's quota in one call."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COALESCE(extra_token_pool, 0) as pool FROM tenants WHERE id = %s", (tenant_id,))
+            pool_row = cur.fetchone()
+            pool = int(pool_row["pool"] if pool_row else 0)
+
+            cur.execute(
+                "SELECT COALESCE(SUM(paid_credit_balance), 0) as allocated FROM user_profiles WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            allocated_row = cur.fetchone()
+            allocated = int(allocated_row["allocated"] if allocated_row else 0)
+
+            cur.execute(
+                """
+                SELECT supabase_auth_id,
+                       display_name,
+                       role,
+                       created_at
+                FROM user_profiles
+                WHERE tenant_id = %s
+                ORDER BY
+                  CASE role
+                    WHEN 'leader' THEN 1
+                    WHEN 'member' THEN 2
+                    ELSE 3
+                  END,
+                  created_at DESC
+                """,
+                (tenant_id,),
+            )
+            member_rows = [dict(r) for r in cur.fetchall()]
+
+            member_quotas: list[dict] = []
+            quota_cur = conn.cursor()
+            try:
+                for member in member_rows:
+                    supabase_auth_id = member["supabase_auth_id"]
+                    daily_budget, daily_used, extra_allocated_member, extra_used = _maybe_reset_daily_tokens(quota_cur, supabase_auth_id)
+                    daily_remaining = max(daily_budget - daily_used, 0)
+                    extra_remaining = max(extra_allocated_member - extra_used, 0)
+                    member_quotas.append({
+                        "supabase_auth_id": supabase_auth_id,
+                        "name": member.get("display_name") or "",
+                        "role": member.get("role", ""),
+                        "quota": {
+                            "daily_budget": daily_budget,
+                            "daily_used": daily_used,
+                            "daily_remaining": daily_remaining,
+                            "extra_allocated": extra_allocated_member,
+                            "extra_used": extra_used,
+                            "extra_remaining": extra_remaining,
+                            "total_available": daily_remaining + extra_remaining,
+                        },
+                    })
+            finally:
+                quota_cur.close()
+
+            conn.commit()
+
+            return {
+                "org": {"extra_pool": pool, "extra_allocated": allocated},
+                "members": member_quotas,
+            }
+
+
+def consume_user_credits(supabase_auth_id: str, tenant_id: str, credits_used: int) -> dict:
+    """Deduct credits from daily budget first, then extra credits.
+    Returns dict with credits_consumed and paid_credit_consumed.
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            daily_budget, daily_used, extra_allocated, extra_used = _maybe_reset_daily_tokens(cur, supabase_auth_id)
+            daily_remaining = max(daily_budget - daily_used, 0)
+            paid_remaining = max(extra_allocated - extra_used, 0)
+            total_available = daily_remaining + paid_remaining
+
+            if credits_used > total_available:
+                raise ValueError("Insufficient credits")
+
+            use_daily = min(credits_used, daily_remaining)
+            use_paid = max(credits_used - use_daily, 0)
+            new_daily_used = daily_used + use_daily
+            new_extra_used = extra_used + use_paid
+
+            cur.execute(
+                "UPDATE user_profiles SET daily_used = %s, paid_credit_used = %s WHERE supabase_auth_id = %s",
+                (new_daily_used, new_extra_used, supabase_auth_id),
+            )
+            conn.commit()
+            return {"credits_consumed": credits_used, "paid_credit_consumed": use_paid}
+
+
+def check_credit_quota(supabase_auth_id: str, tenant_id: str, incoming_credits: int = 0) -> tuple[bool, str]:
+    """Check if user has enough daily + extra credits.
+    Returns (allowed: bool, reason: str).
+    """
+    user = get_user_token_usage(supabase_auth_id)
+
+    # Normal case: within budget
+    if incoming_credits <= user["total_available"]:
+        return True, ""
+
+    # Fully blocked
+    return False, (
+        f"Credit quota exceeded. Leaders can top up credits and allocate them to members. "
+        f"Daily: {user['daily_used']:,}/{user['daily_budget']:,} used, "
+        f"Extra: {user['extra_used']:,}/{user['extra_allocated']:,} used. "
+        f"Available: {user['total_available']:,}"
+    )
+
+
+
+
+def _insert_credit_ledger(cur, tenant_id: str, entry_type: str, credits: int, unit_cost_cents: int, note: str | None, created_by: str | None):
+    cur.execute(
+        """
+        INSERT INTO credit_ledger (tenant_id, entry_type, credits, unit_cost_cents, note, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id, created_at
+        """,
+        (tenant_id, entry_type, credits, unit_cost_cents, note, created_by),
+    )
+    return cur.fetchone()
+
+
+def add_org_extra_credits(tenant_id: str, amount: int, created_by: str | None = None, note: str | None = None) -> dict:
+    """Admin adds extra credits to an org's pool."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE tenants SET extra_token_pool = COALESCE(extra_token_pool, 0) + %s WHERE id = %s RETURNING extra_token_pool",
+                (amount, tenant_id),
+            )
+            row = cur.fetchone()
+            _insert_credit_ledger(cur, tenant_id, "topup", amount, 0, note, created_by)
+            conn.commit()
+            return {"status": "updated", "tenant_id": tenant_id, "extra_token_pool": int(row["extra_token_pool"]) if row else 0}
+
+
+def list_credit_ledger(tenant_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, entry_type, credits, unit_cost_cents, note, created_by, created_at
+                FROM credit_ledger
+                WHERE tenant_id = %s AND entry_type = 'topup'
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (tenant_id, limit, offset),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def list_all_topups(limit: int = 50, offset: int = 0, tenant_id: str | None = None) -> list[dict]:
+    query = [
+        """
+        SELECT cl.id,
+               cl.tenant_id,
+               t.company_name,
+               cl.credits,
+               cl.note,
+               cl.created_by,
+               cl.created_at
+        FROM credit_ledger cl
+        JOIN tenants t ON t.id = cl.tenant_id
+        WHERE cl.entry_type = 'topup'
+        """
+    ]
+    params: list = []
+    if tenant_id:
+        query.append("AND cl.tenant_id = %s")
+        params.append(tenant_id)
+    query.append("ORDER BY cl.created_at DESC LIMIT %s OFFSET %s")
+    params.extend([limit, offset])
+
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("\n".join(query), params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def allocate_member_extra_credits(tenant_id: str, supabase_auth_id: str, amount: int) -> dict:
+    """Leader allocates extra credits from org pool to a member."""
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Verify member is in the org
+            cur.execute("SELECT tenant_id FROM user_profiles WHERE supabase_auth_id = %s", (supabase_auth_id,))
+            row = cur.fetchone()
+            if not row or str(row["tenant_id"]) != tenant_id:
+                raise ValueError("Member not in organization")
+
+            # Lock org row and check pool
+            cur.execute(
+                "SELECT COALESCE(extra_token_pool, 0) as pool FROM tenants WHERE id = %s FOR UPDATE",
+                (tenant_id,),
+            )
+            pool = int(cur.fetchone()["pool"])
+            if pool < amount:
+                raise ValueError(f"Org extra pool has {pool} credits. Cannot allocate {amount}.")
+
+            # Deduct from pool, add to member
+            cur.execute(
+                "UPDATE tenants SET extra_token_pool = extra_token_pool - %s WHERE id = %s",
+                (amount, tenant_id),
+            )
+            cur.execute(
+                "UPDATE user_profiles SET paid_credit_balance = COALESCE(paid_credit_balance, 0) + %s WHERE supabase_auth_id = %s RETURNING paid_credit_balance",
+                (amount, supabase_auth_id),
+            )
+            member_row = cur.fetchone()
+            conn.commit()
+            return {
+                "status": "allocated",
+                "supabase_auth_id": supabase_auth_id,
+                "extra_allocated": int(member_row["paid_credit_balance"]) if member_row else 0,
+                "org_pool_remaining": pool - amount,
+            }

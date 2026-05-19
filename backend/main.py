@@ -1,0 +1,1254 @@
+import asyncio
+import json
+import logging
+import os
+import time
+from threading import RLock
+from typing import Any, Callable
+
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+load_dotenv()
+
+from middleware.auth import get_current_user, UserSession, require_leader, require_member, require_superadmin
+from middleware.anonymizer import anonymizer_engine
+import db
+
+# Production logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("anonymizer")
+
+
+class TTLCache:
+    """Very small helper cache with coarse TTL invalidation."""
+
+    def __init__(self, ttl_seconds: int = 5):
+        self.ttl = ttl_seconds
+        self._store: dict[str, tuple[float, Any]] = {}
+        self._lock = RLock()
+
+    def get(self, key: str) -> Any | None:
+        now = time.time()
+        with self._lock:
+            entry = self._store.get(key)
+            if not entry:
+                return None
+            expires, value = entry
+            if expires < now:
+                self._store.pop(key, None)
+                return None
+            return value
+
+    def set(self, key: str, value: Any) -> Any:
+        with self._lock:
+            self._store[key] = (time.time() + self.ttl, value)
+        return value
+
+    def get_or_set(self, key: str, loader: Callable[[], Any]) -> Any:
+        value = self.get(key)
+        if value is not None:
+            return value
+        fresh = loader()
+        self.set(key, fresh)
+        return fresh
+
+    def invalidate(self, key: str | None = None) -> None:
+        with self._lock:
+            if key is None:
+                self._store.clear()
+            else:
+                self._store.pop(key, None)
+
+
+personal_usage_cache = TTLCache(ttl_seconds=8)
+quota_cache = TTLCache(ttl_seconds=8)
+org_usage_cache = TTLCache(ttl_seconds=12)
+org_quota_cache = TTLCache(ttl_seconds=12)
+companies_cache = TTLCache(ttl_seconds=30)
+global_usage_cache = TTLCache(ttl_seconds=45)
+
+
+def _cached_personal_usage(user_id: str) -> dict:
+    return personal_usage_cache.get_or_set(user_id, lambda: db.get_user_usage(user_id))
+
+
+def _cached_my_quota(user_id: str, tenant_id: str) -> dict:
+    cache_key = f"{user_id}:{tenant_id}"
+    return quota_cache.get_or_set(
+        cache_key,
+        lambda: {
+            "user": db.get_user_token_usage(user_id),
+            "org": db.get_org_token_usage(tenant_id),
+        },
+    )
+
+
+def _cached_org_usage(tenant_id: str) -> dict:
+    return org_usage_cache.get_or_set(tenant_id, lambda: db.get_org_usage(tenant_id))
+
+
+def _cached_org_quota(tenant_id: str) -> dict:
+    return org_quota_cache.get_or_set(tenant_id, lambda: db.get_org_quota_snapshot(tenant_id))
+
+
+def _cached_companies() -> list[dict]:
+    return companies_cache.get_or_set("all", db.list_all_tenants)
+
+
+def _cached_global_usage() -> dict:
+    return global_usage_cache.get_or_set("global", db.get_global_usage)
+
+# Initialize PostgreSQL tables and default tenant on startup
+try:
+    db.init_db()
+    db.ensure_default_tenant()
+    logger.info("PostgreSQL initialized successfully")
+except Exception as e:
+    logger.error("PostgreSQL initialization failed: %s", e)
+
+limiter = Limiter(key_func=get_remote_address)
+
+app = FastAPI(
+    title="Anonymizer Core - Mediation Server",
+    description="Enterprise AI mediation with zero-knowledge anonymity.",
+    version="1.0.0",
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS: restrict to known origins only
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+# AWS Bedrock configuration
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_BEDROCK_MODEL = os.getenv("AWS_BEDROCK_MODEL", "moonshotai.kimi-k2.5")
+
+# AWS Bedrock client (lazy init)
+_bedrock_client = None
+
+def get_bedrock_client():
+    global _bedrock_client
+    if _bedrock_client is None and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        _bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )
+    return _bedrock_client
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant|system)$")
+    content: str = Field(..., min_length=1)
+
+
+class MediationPayload(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=10000)
+    model: str = Field(default="moonshotai.kimi-k2.5")
+    history: list[ChatMessage] = Field(default_factory=list)
+    system_prompt: str | None = Field(default=None, max_length=2000)
+    max_tokens: int = Field(default=1024, ge=256, le=4096)
+    pii_rules: list[str] = Field(default_factory=list)
+
+
+class MediationResponse(BaseModel):
+    sanitized_prompt_preview: str
+    ai_response: str
+    tokens_processed: int
+    model: str
+    duration_ms: int
+
+
+@app.get("/health")
+@limiter.limit("60/minute")
+async def health_check(request: Request):
+    """Liveness + readiness probe."""
+    db_ok = False
+    try:
+        db.get_pool()
+        db_ok = True
+    except Exception:
+        pass
+    return {
+        "status": "online",
+        "service": "Anonymizer Core Mediation Layer",
+        "database": "connected" if db_ok else "unavailable",
+        "version": "1.0.0",
+    }
+
+
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _parse_file_bytes(content: bytes, filename: str) -> str:
+    """Synchronous file parser for use in threadpool executor."""
+    name = filename.lower()
+
+    if name.endswith(".txt") or name.endswith(".md") or name.endswith(".csv"):
+        return content.decode("utf-8", errors="ignore")[:10000]
+
+    if name.endswith(".pdf"):
+        try:
+            from PyPDF2 import PdfReader
+            from io import BytesIO
+            reader = PdfReader(BytesIO(content))
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() or ""
+                if len(text) > 10000:
+                    break
+            return text[:10000]
+        except Exception:
+            return "[PDF extraction failed]"
+
+    if name.endswith(".docx"):
+        try:
+            from docx import Document
+            from io import BytesIO
+            doc = Document(BytesIO(content))
+            text = "\n".join([p.text for p in doc.paragraphs])
+            return text[:10000]
+        except Exception:
+            return "[DOCX extraction failed]"
+
+    return content.decode("utf-8", errors="ignore")[:10000]
+
+
+async def _run_ai_mediation(
+    prompt: str,
+    model: str,
+    current_user: UserSession,
+    history: list[dict] | None = None,
+    system_prompt: str | None = None,
+    max_tokens: int = 1024,
+    pii_rules: list[str] | None = None,
+) -> MediationResponse:
+    """Core mediation logic shared by JSON and multipart endpoints."""
+    start_time = time.time()
+
+    # 1. Anonymize (with optional per-request PII rule filtering)
+    enabled_rules = pii_rules if pii_rules else None
+    anonymized_text = anonymizer_engine.sanitize_prompt(prompt, enabled_rules=enabled_rules)
+
+    # 2. Forward to AWS Bedrock
+    has_aws = AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_ACCESS_KEY_ID != "your-aws-access-key"
+
+    ai_response = ""
+    in_tokens = 0
+    out_tokens = 0
+    tot_tokens = 0
+
+    # Build message history with English + structured markdown instruction
+    # Use custom system prompt from Vault if provided, otherwise use default
+    default_system = (
+        "You must respond in English only. Be concise and helpful. "
+        "Use Markdown formatting for structure: headings, bullet lists, numbered lists, "
+        "code blocks with language tags, bold/italic emphasis, and tables where appropriate. "
+        "Always wrap code in fenced code blocks with the correct language identifier."
+    )
+    effective_system = system_prompt.strip() if system_prompt else default_system
+    messages = [{"role": "system", "content": effective_system}]
+    if history:
+        # Keep last 10 messages to stay within context window
+        for msg in history[-10:]:
+            if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": anonymized_text})
+
+    if not has_aws:
+        in_tokens = sum(len(m["content"].split()) for m in messages)
+        out_tokens = 128
+        tot_tokens = in_tokens + out_tokens
+        await asyncio.sleep(0.5)
+        ai_response = (
+            f"[MOCK RESPONSE] Anonymizer Core received sanitized prompt:\n\n"
+            f"{anonymized_text}\n\n"
+            f"[No AWS Bedrock credentials configured. This is a mock response for testing.]"
+        )
+    else:
+        client = get_bedrock_client()
+        if not client:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AWS Bedrock client initialization failed.",
+            )
+
+        model_id = model if model else AWS_BEDROCK_MODEL
+        body = {
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+
+        # ── Credit quota enforcement ──
+        # Estimate input tokens (~4 chars per token for English)
+        estimated_input = len(anonymized_text) // 4 + 1
+        estimated_credits = db.estimate_request_credits(
+            model_id,
+            estimated_input_tokens=estimated_input,
+            estimated_output_tokens=max_tokens,
+        )
+        allowed, reason = db.check_credit_quota(
+            current_user.user_id,
+            current_user.tenant_id,
+            incoming_credits=estimated_credits,
+        )
+        if not allowed:
+            logger.warning("Quota blocked: user=%s tenant=%s reason=%s", current_user.user_id, current_user.tenant_id, reason)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=reason,
+            )
+
+        try:
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            response_body = json.loads(response["body"].read().decode("utf-8"))
+
+            # Robust response parsing
+            ai_response = ""
+            if isinstance(response_body.get("choices"), list) and response_body["choices"]:
+                ai_response = response_body["choices"][0].get("message", {}).get("content", "")
+            elif isinstance(response_body.get("content"), list) and response_body["content"]:
+                ai_response = response_body["content"][0].get("text", "")
+            elif isinstance(response_body.get("output"), str):
+                ai_response = response_body["output"]
+            elif isinstance(response_body.get("completion"), str):
+                ai_response = response_body["completion"]
+            elif isinstance(response_body.get("results"), list) and response_body["results"]:
+                ai_response = response_body["results"][0].get("outputText", "")
+            elif isinstance(response_body.get("generations"), list) and response_body["generations"]:
+                ai_response = response_body["generations"][0].get("text", "")
+
+            if not ai_response:
+                logger.warning("Empty AI response. Raw: %s", json.dumps(response_body)[:500])
+
+            usage = response_body.get("usage", {})
+            in_tokens = usage.get("input_tokens", usage.get("prompt_tokens", len(anonymized_text.split())))
+            out_tokens = usage.get("output_tokens", usage.get("completion_tokens", 128))
+            tot_tokens = usage.get("total_tokens", in_tokens + out_tokens)
+        except ClientError as e:
+            logger.error("AWS Bedrock error: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Upstream AI provider error.",
+            )
+
+    duration = int((time.time() - start_time) * 1000)
+
+    # 3. Log telemetry & consume credits
+    actual_credits = db.calculate_request_credits(model or model_id, in_tokens, out_tokens)
+    db.save_usage_metric(
+        tenant_id=current_user.tenant_id,
+        supabase_auth_id=current_user.user_id,
+        model_identifier=model,
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+        total_tokens=tot_tokens,
+        duration_ms=duration,
+        credits_used=actual_credits,
+    )
+    try:
+        consumption = db.consume_user_credits(current_user.user_id, current_user.tenant_id, actual_credits)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Insufficient credits. Please ask a leader to top up.")
+    except Exception as exc:
+        logger.exception(
+            "Failed to deduct credits after mediation: user=%s tenant=%s err=%s",
+            current_user.user_id,
+            current_user.tenant_id,
+            str(exc),
+        )
+        raise HTTPException(status_code=500, detail="Usage recorded but quota update failed. Contact support.")
+
+    logger.info(
+        "Telemetry: tenant=%s model=%s tokens=%d credits=%d paid=%d",
+        current_user.tenant_id,
+        model,
+        tot_tokens,
+        consumption["credits_consumed"],
+        consumption.get("paid_credit_consumed", 0),
+    )
+
+    return MediationResponse(
+        sanitized_prompt_preview=anonymized_text[:100],
+        ai_response=ai_response,
+        tokens_processed=tot_tokens,
+        model=model,
+        duration_ms=duration,
+    )
+
+
+@app.post("/api/v1/mediate", response_model=MediationResponse)
+@limiter.limit("30/minute")
+async def execute_anonymous_brokerage(
+    request: Request,
+    payload: MediationPayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Text-only mediation endpoint."""
+    history = [msg.model_dump() for msg in payload.history]
+    return await _run_ai_mediation(
+        payload.prompt,
+        payload.model,
+        current_user,
+        history=history,
+        system_prompt=payload.system_prompt,
+        max_tokens=payload.max_tokens,
+        pii_rules=payload.pii_rules if payload.pii_rules else None,
+    )
+
+
+@app.post("/api/v1/mediate/upload", response_model=MediationResponse)
+@limiter.limit("30/minute")
+async def execute_upload_brokerage(
+    request: Request,
+    prompt: str = Form(..., min_length=1, max_length=10000),
+    model: str = Form(default="moonshotai.kimi-k2.5"),
+    history: str = Form(default="[]"),
+    system_prompt: str | None = Form(default=None),
+    max_tokens: int = Form(default=1024),
+    pii_rules: str = Form(default=""),
+    file: UploadFile = File(None),
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Mediation with optional document upload (PDF, DOCX, TXT, MD)."""
+    full_prompt = prompt
+    if file and file.filename:
+        # Run file processing in threadpool so the event loop is not blocked
+        try:
+            content = await asyncio.get_event_loop().run_in_executor(None, file.file.read)
+        except Exception as e:
+            logger.warning("Could not read uploaded file: %s", e)
+            raise HTTPException(status_code=400, detail="Failed to read uploaded file.")
+
+        if len(content) > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(status_code=413, detail="File too large. Max 5MB.")
+
+        doc_text = await asyncio.get_event_loop().run_in_executor(
+            None, _parse_file_bytes, content, file.filename
+        )
+        if doc_text:
+            full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{prompt}"
+            logger.info("Document uploaded: %s (%d chars)", file.filename, len(doc_text))
+
+    try:
+        history_list = json.loads(history)
+    except json.JSONDecodeError:
+        history_list = []
+
+    try:
+        pii_list = json.loads(pii_rules) if pii_rules else []
+        if not isinstance(pii_list, list):
+            pii_list = []
+    except json.JSONDecodeError:
+        pii_list = []
+
+    return await _run_ai_mediation(
+        full_prompt,
+        model,
+        current_user,
+        history=history_list,
+        system_prompt=system_prompt,
+        max_tokens=max_tokens,
+        pii_rules=pii_list if pii_list else None,
+    )
+
+
+class AnalyticsResponse(BaseModel):
+    total_tokens: int
+    total_tokens_change: float
+    active_tenants: int
+    active_tenants_change: float
+    compute_cost: float
+    compute_cost_change: float
+    chart_data: list[int]
+    logs: list[dict]
+    token_trend: list[int]
+    model_breakdown: list[dict]
+
+
+@app.get("/api/v1/analytics", response_model=AnalyticsResponse)
+@limiter.limit("60/minute")
+async def get_analytics(request: Request, current_user: UserSession = Depends(get_current_user)):
+    try:
+        data = db.get_analytics(tenant_id=current_user.tenant_id)
+        logs = data["logs"]
+        total_tokens = data["total_tokens"]
+        active_tenants = data["active_tenants"]
+        compute_cost = data["compute_cost"]
+    except Exception as e:
+        logger.error("Analytics query failed: %s", e)
+        # Fallback to empty analytics
+        total_tokens = 0
+        active_tenants = 1
+        compute_cost = 0.0
+        logs = []
+
+    # Generate chart data from log durations
+    chart_data = [20, 30, 40, 60, 70, 80, 90]
+    if logs:
+        chart_data = [min(100, max(5, int(log["duration_ms"] // 10))) for log in logs[-7:]]
+        while len(chart_data) < 7:
+            chart_data.append(20)
+
+    return AnalyticsResponse(
+        total_tokens=total_tokens,
+        total_tokens_change=12.4,
+        active_tenants=active_tenants,
+        active_tenants_change=5.1,
+        compute_cost=compute_cost,
+        compute_cost_change=2.8,
+        chart_data=chart_data,
+        logs=logs,
+        token_trend=data.get("token_trend", [0, 0, 0, 0, 0, 0, 0]),
+        model_breakdown=data.get("model_breakdown", []),
+    )
+
+
+# ── API Key Management ────────────────────────────────────────────
+
+class CreateKeyPayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=150)
+    scopes: list[str] = Field(default_factory=lambda: ["mediate", "analytics"])
+    expires_days: int | None = Field(default=None, ge=1, le=365)
+
+
+@app.get("/api/v1/me")
+@limiter.limit("60/minute")
+async def get_current_user_info(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Return current user's identity and role. Auto-creates profile if missing."""
+    # Ensure profile exists (for new Supabase signups)
+    profile = db.ensure_user_profile(
+        current_user.user_id,
+        current_user.email,
+        current_user.tenant_id,
+    )
+    return {
+        "user_id": current_user.user_id,
+        "email": current_user.email,
+        "tenant_id": profile["tenant_id"],
+        "role": profile["role"],
+        "is_platform_admin": profile["is_platform_admin"],
+    }
+
+
+@app.get("/api/v1/me/usage")
+@limiter.limit("60/minute")
+async def get_my_usage(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Return personal usage stats for the authenticated user."""
+    usage = db.get_user_usage(current_user.user_id)
+    return usage
+
+
+@app.get("/api/v1/admin/users/{supabase_auth_id}/usage")
+@limiter.limit("60/minute")
+async def admin_get_user_usage(
+    request: Request,
+    supabase_auth_id: str,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Return usage stats for any user. Superadmin only."""
+    usage = db.get_user_usage(supabase_auth_id)
+    return usage
+
+
+@app.get("/api/v1/keys")
+@limiter.limit("60/minute")
+async def list_keys(
+    request: Request,
+    current_user: UserSession = Depends(require_member),
+):
+    """List all active API keys for the tenant."""
+    keys = db.list_api_keys(current_user.tenant_id)
+    return {"keys": keys}
+
+
+@app.post("/api/v1/keys")
+@limiter.limit("30/minute")
+async def create_key(
+    request: Request,
+    payload: CreateKeyPayload,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Create a new API key. Leaders only."""
+    raw_key, key_id = db.create_api_key(
+        tenant_id=current_user.tenant_id,
+        created_by=current_user.user_id,
+        name=payload.name,
+        scopes=payload.scopes,
+        expires_days=payload.expires_days,
+    )
+    return {
+        "id": key_id,
+        "key": raw_key,  # shown ONLY once at creation
+        "name": payload.name,
+        "scopes": payload.scopes,
+    }
+
+
+@app.delete("/api/v1/keys/{key_id}")
+@limiter.limit("30/minute")
+async def revoke_key(
+    request: Request,
+    key_id: str,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Revoke (deactivate) an API key. Leaders only."""
+    ok = db.revoke_api_key(key_id, current_user.tenant_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="API key not found.")
+    return {"status": "revoked", "id": key_id}
+
+
+# ── Token Quota Management ──────────────────────────────────────
+
+class AddExtraPayload(BaseModel):
+    amount: int = Field(..., ge=1)
+
+
+class EstimateCostPayload(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    model: str | None = Field(default=None)
+    max_tokens: int = Field(default=4000, ge=1, le=8000)
+
+
+class CheckQuotaPayload(BaseModel):
+    estimated_input_tokens: int = Field(..., ge=1, le=100000)
+    estimated_output_tokens: int = Field(..., ge=1, le=100000)
+
+
+class DummyCardPayload(BaseModel):
+    number: str = Field(..., min_length=16, max_length=16)
+    exp_month: int = Field(..., ge=1, le=12)
+    exp_year: int = Field(..., ge=2024)
+    cvc: str = Field(..., min_length=3, max_length=4)
+    name: str | None = None
+
+
+class TopUpPayload(BaseModel):
+    amount: int = Field(..., ge=1)
+    note: str | None = Field(default=None, max_length=500)
+    card: DummyCardPayload
+
+
+@app.post("/api/v1/me/estimate-cost")
+@limiter.limit("60/minute")
+async def estimate_cost(
+    request: Request,
+    payload: EstimateCostPayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Pre-flight estimate of request cost in credits."""
+    model_id = payload.model if payload.model else AWS_BEDROCK_MODEL
+    estimated_input = len(payload.prompt) // 4 + 1
+    estimated_credits = db.estimate_request_credits(
+        model_id,
+        estimated_input_tokens=estimated_input,
+        estimated_output_tokens=payload.max_tokens,
+    )
+    user_quota = db.get_user_token_usage(current_user.user_id)
+    return {
+        "estimated_input_tokens": estimated_input,
+        "estimated_output_tokens": payload.max_tokens,
+        "estimated_credits": estimated_credits,
+        "daily_budget": user_quota["daily_budget"],
+        "daily_used": user_quota["daily_used"],
+        "daily_remaining": user_quota["daily_remaining"],
+        "extra_remaining": user_quota["extra_remaining"],
+        "total_available": user_quota["total_available"],
+        "soft_available": user_quota["soft_available"],
+        "warning_level": user_quota["warning_level"],
+        "sufficient": estimated_credits <= user_quota["total_available"],
+    }
+
+
+@app.get("/api/v1/me/quota")
+@limiter.limit("60/minute")
+async def get_my_quota(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Return current user's credit quota status (daily + extra)."""
+    user = db.get_user_token_usage(current_user.user_id)
+    org = db.get_org_token_usage(current_user.tenant_id)
+    return {"user": user, "org": org}
+
+
+@app.get("/api/v1/dashboard/summary")
+@limiter.limit("30/minute")
+async def get_dashboard_summary(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Aggregate all dashboard data in a single round trip."""
+    profile = db.ensure_user_profile(current_user.user_id, current_user.email, current_user.tenant_id)
+    role = profile.get("role", "member")
+    tenant_id = str(profile.get("tenant_id", current_user.tenant_id))
+    is_superadmin = bool(profile.get("is_platform_admin"))
+    is_leader = role == "leader"
+
+    payload: dict[str, Any] = {
+        "role": role,
+        "is_platform_admin": is_superadmin,
+        "generated_at": int(time.time()),
+    }
+
+    if not is_superadmin:
+        payload["personal"] = _cached_personal_usage(current_user.user_id)
+        payload["my_quota"] = _cached_my_quota(current_user.user_id, tenant_id)
+
+    if is_leader:
+        payload["org"] = _cached_org_usage(tenant_id)
+        payload["org_quota"] = _cached_org_quota(tenant_id)
+
+    if is_superadmin:
+        payload["companies"] = _cached_companies()
+        payload["global_usage"] = _cached_global_usage()
+
+    return payload
+
+
+@app.get("/api/v1/org/quota")
+@limiter.limit("60/minute")
+async def get_org_quota(
+    request: Request,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Return org credit quota status. Leaders+ only."""
+    return _cached_org_quota(current_user.tenant_id)
+
+
+@app.post("/api/v1/admin/tenants/{tenant_id}/extra-tokens")
+@limiter.limit("30/minute")
+async def admin_add_org_extra_tokens(
+    request: Request,
+    tenant_id: str,
+    payload: AddExtraPayload,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Add extra credits to an org's pool. Superadmin only."""
+    result = db.add_org_extra_credits(tenant_id, payload.amount, current_user.user_id, "Manual adjustment")
+    return result
+
+
+@app.post("/api/v1/admin/tenants/{tenant_id}/topup")
+@limiter.limit("30/minute")
+async def admin_topup_tenant(
+    request: Request,
+    tenant_id: str,
+    payload: TopUpPayload,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Simulate a credit purchase via dummy card input."""
+    card_number = payload.card.number
+    if not card_number.isdigit() or len(card_number) != 16:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid card number")
+    if set(card_number) != {"0"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Test mode only accepts 0000 0000 0000 0000")
+    result = db.add_org_extra_credits(
+        tenant_id,
+        payload.amount,
+        current_user.user_id,
+        payload.note or "Dummy card top-up",
+    )
+    return {"status": "success", "extra_token_pool": result["extra_token_pool"], "note": payload.note or "Dummy card top-up"}
+
+
+@app.get("/api/v1/admin/topups")
+@limiter.limit("30/minute")
+async def admin_list_topups(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    tenant_id: str | None = None,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    entries = db.list_all_topups(limit=limit, offset=offset, tenant_id=tenant_id)
+    return {"entries": entries}
+
+
+@app.get("/api/v1/admin/tenants/{tenant_id}/ledger")
+@limiter.limit("30/minute")
+async def admin_get_credit_ledger(
+    request: Request,
+    tenant_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: UserSession = Depends(require_superadmin),
+):
+    entries = db.list_credit_ledger(tenant_id, limit=limit, offset=offset)
+    return {"entries": entries}
+
+
+@app.post("/api/v1/org/members/{supabase_auth_id}/extra-tokens")
+@limiter.limit("30/minute")
+async def leader_allocate_member_extra(
+    request: Request,
+    supabase_auth_id: str,
+    payload: AddExtraPayload,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Leader allocates extra credits from org pool to a member."""
+    profile = db.ensure_user_profile(supabase_auth_id, "")
+    if not profile or str(profile["tenant_id"]) != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Can only modify members in your organization.")
+    try:
+        result = db.allocate_member_extra_credits(current_user.tenant_id, supabase_auth_id, payload.amount)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/v1/org/topup")
+@limiter.limit("30/minute")
+async def leader_topup_org(
+    request: Request,
+    payload: TopUpPayload,
+    current_user: UserSession = Depends(require_leader),
+):
+    card_number = payload.card.number
+    if not card_number.isdigit() or len(card_number) != 16:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid card number")
+    if set(card_number) != {"0"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Test mode only accepts 0000 0000 0000 0000")
+    result = db.add_org_extra_credits(
+        current_user.tenant_id,
+        payload.amount,
+        current_user.user_id,
+        payload.note or "Leader top-up",
+    )
+    return {"status": "success", "extra_token_pool": result["extra_token_pool"], "note": payload.note or "Leader top-up"}
+
+
+@app.get("/api/v1/org/ledger")
+@limiter.limit("30/minute")
+async def org_credit_ledger(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: UserSession = Depends(require_leader),
+):
+    entries = db.list_credit_ledger(current_user.tenant_id, limit=limit, offset=offset)
+    return {"entries": entries}
+
+
+# ── Org Management ────────────────────────────────────────────────
+
+class InvitePayload(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    role: str = Field(default="member", pattern=r"^(leader|member)$")
+
+
+class UpdateRolePayload(BaseModel):
+    role: str = Field(..., pattern=r"^(leader|member)$")
+
+
+@app.get("/api/v1/org/members")
+@limiter.limit("60/minute")
+async def list_org_members(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """List all members of the current user's org."""
+    members = db.list_org_members(current_user.tenant_id)
+    return {"members": members}
+
+
+@app.post("/api/v1/org/invite")
+@limiter.limit("30/minute")
+async def invite_member(
+    request: Request,
+    payload: InvitePayload,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Invite a user to the org by email. Leaders only."""
+    try:
+        token, invite_id = db.create_invite(
+            tenant_id=current_user.tenant_id,
+            email=payload.email,
+            role=payload.role,
+            invited_by_auth_id=current_user.user_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "id": invite_id,
+        "token": token,
+        "email": payload.email,
+        "role": payload.role,
+        "expires_in_days": 7,
+    }
+
+
+@app.patch("/api/v1/org/members/{profile_id}/role")
+@limiter.limit("30/minute")
+async def update_member_role(
+    request: Request,
+    profile_id: str,
+    payload: UpdateRolePayload,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Update a member's role. Leaders can only set member/leader."""
+    ok = db.update_member_role(current_user.tenant_id, profile_id, payload.role)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Member not found.")
+    return {"status": "updated", "profile_id": profile_id, "role": payload.role}
+
+
+@app.delete("/api/v1/org/members/{profile_id}")
+@limiter.limit("30/minute")
+async def remove_member(
+    request: Request,
+    profile_id: str,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Remove a member from the org. Leaders only. Cannot remove last leader."""
+    try:
+        ok = db.remove_org_member(current_user.tenant_id, profile_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Member not found.")
+        return {"status": "removed", "profile_id": profile_id}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/v1/org/usage")
+@limiter.limit("60/minute")
+async def org_usage(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Get usage summary for the current org. Any org member."""
+    usage = db.get_org_usage(current_user.tenant_id)
+    return usage
+
+
+@app.get("/api/v1/org/invites")
+@limiter.limit("60/minute")
+async def list_pending_invites(
+    request: Request,
+    current_user: UserSession = Depends(require_leader),
+):
+    """List pending invites for the org. Leaders only."""
+    invites = db.list_invites(current_user.tenant_id)
+    return {"invites": invites}
+
+
+@app.delete("/api/v1/org/invites/{invite_id}")
+@limiter.limit("30/minute")
+async def revoke_invite_endpoint(
+    request: Request,
+    invite_id: str,
+    current_user: UserSession = Depends(require_leader),
+):
+    """Revoke (cancel) a pending invite. Leaders only."""
+    ok = db.revoke_invite(invite_id, current_user.tenant_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Invite not found.")
+    return {"status": "revoked", "id": invite_id}
+
+
+# ── Superadmin (Platform) ───────────────────────────────────────
+
+class CreateCompanyPayload(BaseModel):
+    company_name: str = Field(..., min_length=1, max_length=255)
+    tier: str = Field(default="standard", pattern=r"^(standard|premium|enterprise)$")
+
+
+class AssignLeaderPayload(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+
+
+@app.get("/api/v1/admin/companies")
+@limiter.limit("30/minute")
+async def admin_list_companies(
+    request: Request,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """List all tenants. Superadmin only."""
+    tenants = db.list_all_tenants()
+    return {"companies": tenants}
+
+
+@app.post("/api/v1/admin/companies")
+@limiter.limit("30/minute")
+async def admin_create_company(
+    request: Request,
+    payload: CreateCompanyPayload,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Create a new company/tenant. Superadmin only."""
+    tenant_id = db.create_tenant(payload.company_name, payload.tier)
+    return {"id": tenant_id, "company_name": payload.company_name, "tier": payload.tier}
+
+
+@app.get("/api/v1/admin/companies/{tenant_id}")
+@limiter.limit("30/minute")
+async def admin_company_detail(
+    request: Request,
+    tenant_id: str,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Get detailed view of a company. Superadmin only."""
+    detail = db.get_tenant_details(tenant_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Company not found.")
+    return detail
+
+
+@app.post("/api/v1/admin/companies/{tenant_id}/leader")
+@limiter.limit("30/minute")
+async def admin_assign_leader(
+    request: Request,
+    tenant_id: str,
+    payload: AssignLeaderPayload,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Invite a leader to a company. Superadmin only."""
+    try:
+        token, invite_id = db.assign_leader_to_tenant(tenant_id, payload.email, current_user.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "id": invite_id,
+        "token": token,
+        "email": payload.email,
+        "role": "leader",
+        "expires_in_days": 7,
+    }
+
+
+@app.get("/api/v1/admin/users")
+@limiter.limit("30/minute")
+async def admin_list_all_users(
+    request: Request,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """List all users across all companies. Superadmin only."""
+    users = db.list_all_users()
+    return {"users": users}
+
+
+@app.patch("/api/v1/admin/users/{profile_id}/role")
+@limiter.limit("30/minute")
+async def admin_update_user_role(
+    request: Request,
+    profile_id: str,
+    payload: UpdateRolePayload,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Change any user's role globally. Superadmin only."""
+    ok = db.update_any_user_role(profile_id, payload.role)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "updated", "profile_id": profile_id, "role": payload.role}
+
+
+@app.delete("/api/v1/admin/users/{profile_id}")
+@limiter.limit("30/minute")
+async def admin_delete_user(
+    request: Request,
+    profile_id: str,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Delete any user globally. Superadmin only."""
+    ok = db.delete_any_user(profile_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "deleted", "profile_id": profile_id}
+
+
+@app.get("/api/v1/admin/usage")
+@limiter.limit("60/minute")
+async def admin_global_usage(
+    request: Request,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Return global usage stats across all tenants. Superadmin only."""
+    usage = db.get_global_usage()
+    return usage
+
+
+# ── Chat Sessions (Authenticated, per-user) ───────────────────────
+
+class CreateSessionPayload(BaseModel):
+    title: str = Field(default="New Session", min_length=1, max_length=255)
+    model_id: str = Field(..., min_length=1, max_length=150)
+
+
+class RenameSessionPayload(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+
+
+class AddMessagePayload(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., min_length=1)
+
+
+@app.get("/api/v1/sessions")
+@limiter.limit("60/minute")
+async def list_sessions(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """List all chat sessions for the current user."""
+    sessions = db.list_chat_sessions(current_user.user_id)
+    return {"sessions": sessions}
+
+
+@app.post("/api/v1/sessions")
+@limiter.limit("30/minute")
+async def create_session(
+    request: Request,
+    payload: CreateSessionPayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Create a new chat session."""
+    session = db.create_chat_session(
+        current_user.user_id, payload.title, payload.model_id
+    )
+    return {"session": session}
+
+
+@app.get("/api/v1/sessions/{session_id}")
+@limiter.limit("60/minute")
+async def get_session(
+    request: Request,
+    session_id: str,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Get a single session with its messages."""
+    session = db.get_chat_session(session_id, current_user.user_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"session": session}
+
+
+@app.patch("/api/v1/sessions/{session_id}")
+@limiter.limit("30/minute")
+async def rename_session(
+    request: Request,
+    session_id: str,
+    payload: RenameSessionPayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Rename a chat session."""
+    ok = db.update_chat_session_title(session_id, current_user.user_id, payload.title)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"status": "updated"}
+
+
+@app.delete("/api/v1/sessions/{session_id}")
+@limiter.limit("30/minute")
+async def delete_session(
+    request: Request,
+    session_id: str,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Delete a chat session and all its messages."""
+    ok = db.delete_chat_session(session_id, current_user.user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"status": "deleted"}
+
+
+@app.post("/api/v1/sessions/{session_id}/messages")
+@limiter.limit("60/minute")
+async def add_message(
+    request: Request,
+    session_id: str,
+    payload: AddMessagePayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Add a message to a chat session."""
+    msg = db.add_chat_message(
+        session_id, payload.role, payload.content, current_user.user_id
+    )
+    if not msg:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"message": msg}
+
+
+# ── Invite (Public + Authenticated) ───────────────────────────────
+
+@app.get("/api/v1/invite/validate")
+@limiter.limit("30/minute")
+async def validate_invite(
+    request: Request,
+    token: str,
+):
+    """Validate an invite token. Returns invite details or 404."""
+    invite = db.validate_invite_token(token)
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invalid or expired invite.")
+    return {
+        "valid": True,
+        "tenant_id": invite["tenant_id"],
+        "tenant_name": invite["tenant_name"],
+        "email": invite["email"],
+        "role": invite["role"],
+    }
+
+
+class AcceptInvitePayload(BaseModel):
+    token: str = Field(..., min_length=1)
+
+
+@app.post("/api/v1/invite/accept")
+@limiter.limit("30/minute")
+async def accept_invite_endpoint(
+    request: Request,
+    payload: AcceptInvitePayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Redeem an invite token. Updates user's tenant and role."""
+    result = db.accept_invite(
+        payload.token,
+        current_user.user_id,
+        current_user.email,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Invalid or expired invite.")
+    return {
+        "status": "accepted",
+        "tenant_id": result["tenant_id"],
+        "role": result["role"],
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
