@@ -651,7 +651,7 @@ export default function OrgPage() {
                   />
                   <button
                     onClick={() => {
-                      navigator.clipboard.writeText(generatedLink);
+                      const el = document.createElement("textarea"); el.value = generatedLink; document.body.appendChild(el); el.select(); document.execCommand("copy"); document.body.removeChild(el);
                       setCopied(true);
                       setTimeout(() => setCopied(false), 2000);
                     }}

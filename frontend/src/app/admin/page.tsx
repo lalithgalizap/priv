@@ -470,7 +470,10 @@ export default function AdminPage() {
                 <div className="flex items-center gap-2 p-3 bg-secondary/5 border border-secondary/20 rounded-lg">
                   <Link className="w-4 h-4 text-secondary flex-shrink-0" />
                   <input readOnly value={generatedLink} className="flex-1 bg-transparent text-xs font-mono text-on-surface focus:outline-none truncate" />
-                  <button onClick={() => { navigator.clipboard.writeText(generatedLink); setCopied(true); setTimeout(() => setCopied(false), 2000); }}
+                  <button onClick={() => { 
+                    const el = document.createElement("textarea"); el.value = generatedLink; document.body.appendChild(el); el.select(); document.execCommand("copy"); document.body.removeChild(el);
+                    setCopied(true); setTimeout(() => setCopied(false), 2000); 
+                  }}
                     className="flex items-center gap-1 text-[10px] font-mono text-secondary border border-secondary/30 px-2 py-1 rounded hover:bg-secondary/10 transition-colors flex-shrink-0">
                     {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}{copied ? "Copied" : "Copy"}
                   </button>
