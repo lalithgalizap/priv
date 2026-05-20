@@ -60,7 +60,7 @@ export default function TermsPage() {
 
           <section>
             <h2 className="font-sans text-xl font-bold text-white mb-3">9. Contact</h2>
-            <p>For questions about these terms, contact us through the in-app support form or email legal@quintal.ai.</p>
+            <p>For questions about these terms, contact us through the in-app support form.</p>
           </section>
         </div>
       </main>

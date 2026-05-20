@@ -87,7 +87,7 @@ export default function CompanyDetailPage() {
 
   useEffect(() => {
     if (!id || userLoading) return;
-    if (!user) { router.push("/login"); return; }
+    if (!user) return; // Still loading or not authenticated — don't redirect yet
     if (!isSuperadmin) { router.push("/dashboard"); return; }
     fetchCompany();
   }, [id, userLoading, user?.id, isSuperadmin]);
@@ -96,7 +96,7 @@ export default function CompanyDetailPage() {
   if (error || !company) return <AppShell><div className="flex items-center justify-center h-[400px]"><p className="text-error font-mono text-sm">{error || "Company not found."}</p></div></AppShell>;
 
   const tenant = company.tenant;
-  const usage = company.usage;
+  const usage = company.usage || { total_tokens: 0, active_users: 0, total_calls: 0, compute_cost: 0, model_breakdown: [] };
 
   return (
     <AppShell>
@@ -122,10 +122,10 @@ export default function CompanyDetailPage() {
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
           {[
             { label: "Credit Pool", value: (tenant.extra_token_pool || 0).toLocaleString() },
-            { label: "Total Tokens", value: usage.total_tokens.toLocaleString() },
-            { label: "Total Calls", value: usage.total_calls.toLocaleString() },
-            { label: "Active Users", value: usage.active_users.toLocaleString() },
-            { label: "Members", value: company.members.length.toString() },
+            { label: "Total Tokens", value: (usage.total_tokens || 0).toLocaleString() },
+            { label: "Total Calls", value: (usage.total_calls || 0).toLocaleString() },
+            { label: "Active Users", value: (usage.active_users || 0).toLocaleString() },
+            { label: "Members", value: (company.members?.length || 0).toString() },
           ].map((kpi) => (
             <div key={kpi.label} className="glass-panel rounded-xl p-4">
               <p className="text-[10px] font-mono text-outline uppercase mb-1">{kpi.label}</p>

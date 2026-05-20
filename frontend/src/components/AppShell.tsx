@@ -78,7 +78,7 @@ export default function AppShell({ children }: AppShellProps) {
   async function handleLogout() {
     await supabase.auth.signOut();
     document.cookie = "sb-access-token=; path=/; max-age=0";
-    router.push("/login");
+    window.location.href = "/login";
   }
 
   function handleSupportSubmit(e: React.FormEvent) {

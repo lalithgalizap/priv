@@ -123,7 +123,7 @@ export default function AdminPage() {
 
   useEffect(() => {
     if (userLoading) return;
-    if (!user) { router.push("/login"); return; }
+    if (!user) return;
     if (!isSuperadmin) { router.push("/dashboard"); return; }
   }, [userLoading, user, isSuperadmin, router]);
 

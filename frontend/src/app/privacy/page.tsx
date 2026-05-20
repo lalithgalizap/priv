@@ -50,7 +50,7 @@ export default function PrivacyPage() {
 
           <section>
             <h2 className="font-sans text-xl font-bold text-white mb-3">7. Contact</h2>
-            <p>For privacy-related inquiries, contact us through the in-app support form or email privacy@quintal.ai.</p>
+            <p>For privacy-related inquiries, contact us through the in-app support form.</p>
           </section>
         </div>
       </main>
