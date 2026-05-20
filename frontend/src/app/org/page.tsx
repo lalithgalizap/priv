@@ -647,19 +647,9 @@ export default function OrgPage() {
                   <input
                     readOnly
                     value={generatedLink}
+                    onClick={(e) => (e.target as HTMLInputElement).select()}
                     className="flex-1 bg-transparent text-xs font-mono text-on-surface focus:outline-none"
                   />
-                  <button
-                    onClick={() => {
-                      const el = document.createElement("textarea"); el.value = generatedLink; document.body.appendChild(el); el.select(); document.execCommand("copy"); document.body.removeChild(el);
-                      setCopied(true);
-                      setTimeout(() => setCopied(false), 2000);
-                    }}
-                    className="flex items-center gap-1 text-[10px] font-mono text-secondary border border-secondary/30 px-2 py-1 rounded hover:bg-secondary/10 transition-colors"
-                  >
-                    {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                    {copied ? "Copied" : "Copy"}
-                  </button>
                 </div>
               </div>
             )}
