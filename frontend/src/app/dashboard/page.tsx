@@ -57,46 +57,6 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  async function fetchDashboard() {
-    setError("");
-    setLoading(true);
-    try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) {
-        throw new Error("Not authenticated.");
-      }
-
-      const res = await fetch("/api/dashboard/summary", {
-        headers: { Authorization: `Bearer ${t}` },
-      });
-
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Failed to load dashboard.");
-      }
-
-      const data = await res.json();
-
-      setPersonal(data.personal ?? null);
-      setMyQuota(data.my_quota ?? null);
-      setOrg(data.org ?? null);
-      setOrgQuota(data.org_quota ?? null);
-      setCompanies(data.companies ?? []);
-      setGlobalData(data.global_usage ?? null);
-    } catch (err) {
-      setPersonal(null);
-      setMyQuota(null);
-      setOrg(null);
-      setOrgQuota(null);
-      setCompanies([]);
-      setGlobalData(null);
-      setError(err instanceof Error ? err.message : "Failed to load dashboard.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
   useEffect(() => {
     if (userLoading) return;
     if (!user) {
@@ -104,7 +64,41 @@ export default function DashboardPage() {
       setLoading(false);
       return;
     }
-    fetchDashboard();
+    let cancelled = false;
+    async function load() {
+      setError("");
+      setLoading(true);
+      try {
+        const { data: sesh } = await supabase.auth.getSession();
+        const t = sesh.session?.access_token;
+        if (!t || cancelled) { if (!cancelled) setLoading(false); return; }
+
+        const res = await fetch("/api/dashboard/summary", {
+          headers: { Authorization: `Bearer ${t}` },
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || "Failed to load dashboard.");
+        }
+        const data = await res.json();
+        if (cancelled) return;
+        setPersonal(data.personal ?? null);
+        setMyQuota(data.my_quota ?? null);
+        setOrg(data.org ?? null);
+        setOrgQuota(data.org_quota ?? null);
+        setCompanies(data.companies ?? []);
+        setGlobalData(data.global_usage ?? null);
+      } catch (err) {
+        if (cancelled) return;
+        setPersonal(null); setMyQuota(null); setOrg(null); setOrgQuota(null); setCompanies([]); setGlobalData(null);
+        setError(err instanceof Error ? err.message : "Failed to load dashboard.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    return () => { cancelled = true; };
   }, [userLoading, user?.id]);
 
   const role = user?.role ?? null;
@@ -220,40 +214,35 @@ export default function DashboardPage() {
         </div>
       ) : (
         <div className="space-y-6">
-          {/* ── ADMIN COMPANY LIST (superadmin only) ── */}
+          {/* ── ADMIN OVERVIEW (superadmin only) ── */}
           {isSuperadmin && (
             <section>
               <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-outline uppercase mb-4 flex items-center gap-2">
-                <Building2 className="w-4 h-4 text-primary" /> All Companies
+                <Building2 className="w-4 h-4 text-primary" /> Platform Overview
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {companies.length === 0 ? (
-                  <p className="text-sm text-outline font-mono col-span-full text-center py-12">No companies yet</p>
-                ) : (
-                  companies.map((comp) => {
-                    return (
-                      <a
-                        key={comp.id}
-                        href={`/admin/companies/${comp.id}`}
-                        className="glass-panel rounded-xl p-5 hover:bg-surface-container-high/30 transition-colors block"
-                      >
-                        <div className="flex items-center justify-between mb-3">
-                          <div className="flex items-center gap-2">
-                            <Building2 className="w-5 h-5 text-primary/60" />
-                            <span className="text-sm font-medium text-on-surface truncate">{comp.company_name}</span>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-4 text-xs font-mono text-outline-variant mb-3">
-                          <span className="flex items-center gap-1"><Users className="w-3 h-3" /> {comp.member_count} members</span>
-                          <span className="flex items-center gap-1"><Activity className="w-3 h-3" /> {comp.total_tokens?.toLocaleString() || 0} tokens used</span>
-                        </div>
-                        <p className="text-[10px] font-mono text-secondary">
-                          Extra pool: {comp.extra_token_pool?.toLocaleString() || 0} credits
-                        </p>
-                      </a>
-                    );
-                  })
-                )}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <a href="/admin" className="glass-panel rounded-xl p-5 hover:bg-surface-container-high/30 transition-colors block">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Building2 className="w-4 h-4 text-primary" />
+                    <span className="text-xs font-mono text-outline-variant uppercase">Companies</span>
+                  </div>
+                  <p className="text-2xl font-semibold text-on-surface">{companies.length}</p>
+                  <p className="text-[10px] text-outline mt-1">View all in Admin →</p>
+                </a>
+                <div className="glass-panel rounded-xl p-5">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Users className="w-4 h-4 text-secondary" />
+                    <span className="text-xs font-mono text-outline-variant uppercase">Total Members</span>
+                  </div>
+                  <p className="text-2xl font-semibold text-on-surface">{companies.reduce((s, c) => s + (c.member_count || 0), 0)}</p>
+                </div>
+                <div className="glass-panel rounded-xl p-5">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Activity className="w-4 h-4 text-tertiary" />
+                    <span className="text-xs font-mono text-outline-variant uppercase">Total Tokens Used</span>
+                  </div>
+                  <p className="text-2xl font-semibold text-on-surface">{companies.reduce((s, c) => s + (c.total_tokens || 0), 0).toLocaleString()}</p>
+                </div>
               </div>
             </section>
           )}
@@ -283,13 +272,6 @@ export default function DashboardPage() {
                       <p className="mt-2 font-mono text-[10px] text-outline/60">Extra: {myQuota.user.extra_remaining.toLocaleString()} / {myQuota.user.extra_allocated.toLocaleString()} remaining</p>
                     )}
                     <p className="mt-1 font-mono text-[10px] text-outline/60 text-right">Total available: {myQuota.user.total_available.toLocaleString()}</p>
-                  </div>
-                  <div className="glass-panel rounded-xl p-4">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="font-mono text-xs text-outline uppercase">Org Extra Pool</span>
-                      <span className="font-mono text-xs text-on-surface">{myQuota.org.extra_pool.toLocaleString()} available</span>
-                    </div>
-                    <p className="font-mono text-[10px] text-outline/60">Allocated to members: {myQuota.org.extra_allocated.toLocaleString()}</p>
                   </div>
                 </div>
               )}
@@ -329,30 +311,28 @@ export default function DashboardPage() {
                 <StatCard icon={Wallet} label="Company Cost" value={`$${org.compute_cost.toFixed(2)}`} color="error" />
               </div>
               <ModelBreakdownCard title="Company Models" data={org.model_breakdown} icon={Building2} />
-              {orgQuota && orgQuota.members.length > 0 && (
-                <div className="mt-6 glass-panel rounded-xl p-6">
-                  <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-on-surface uppercase mb-4 pb-4 border-b border-outline-variant/20 flex items-center gap-2">
-                    <Users className="w-4 h-4 text-primary" /> Member Credits
-                  </h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {orgQuota.members.map((m, i) => (
-                      <div key={i} className="glass-panel rounded-xl p-4">
-                        <div className="flex justify-between items-center mb-2">
-                          <span className="font-mono text-xs text-outline uppercase">{m.name || m.email} ({m.role})</span>
-                        </div>
-                        <div className="flex justify-between items-center mb-1">
-                          <span className="font-mono text-[10px] text-outline">Daily</span>
-                          <span className="font-mono text-[10px] text-on-surface">{m.quota.daily_used} / {m.quota.daily_budget}</span>
-                        </div>
-                        {m.quota.extra_allocated > 0 && (
-                          <div className="flex justify-between items-center">
-                            <span className="font-mono text-[10px] text-outline">Extra</span>
-                            <span className="font-mono text-[10px] text-on-surface">{m.quota.extra_remaining} / {m.quota.extra_allocated}</span>
-                          </div>
-                        )}
-                        <p className="mt-1 font-mono text-[10px] text-outline/60 text-right">Total: {m.quota.total_available}</p>
-                      </div>
-                    ))}
+              {orgQuota && (
+                <div className="mt-6 glass-panel rounded-xl p-5">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Users className="w-4 h-4 text-primary" />
+                      <span className="font-mono text-xs text-outline uppercase">Team Overview</span>
+                    </div>
+                    <a href="/org" className="text-xs text-primary hover:text-secondary transition-colors">Manage members →</a>
+                  </div>
+                  <div className="grid grid-cols-3 gap-4 mt-3">
+                    <div>
+                      <p className="text-[10px] text-outline font-mono">Members</p>
+                      <p className="text-lg font-semibold text-on-surface">{orgQuota.members.length}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-outline font-mono">Org Pool</p>
+                      <p className="text-lg font-semibold text-on-surface">{orgQuota.org.extra_pool.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-outline font-mono">Allocated</p>
+                      <p className="text-lg font-semibold text-on-surface">{orgQuota.org.extra_allocated.toLocaleString()}</p>
+                    </div>
                   </div>
                 </div>
               )}

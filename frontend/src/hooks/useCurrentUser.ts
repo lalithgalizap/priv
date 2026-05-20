@@ -17,7 +17,19 @@ interface CurrentUserData {
 
 let cachedUser: CurrentUserResponse | null = null;
 let cachedToken: string | null = null;
+let cachedAuthId: string | null = null;
 let inflight: Promise<CurrentUserData> | null = null;
+
+// Clear cache when auth state changes (logout/login as different user)
+supabase.auth.onAuthStateChange((event, session) => {
+  const newAuthId = session?.user?.id || null;
+  if (newAuthId !== cachedAuthId) {
+    cachedUser = null;
+    cachedToken = null;
+    cachedAuthId = newAuthId;
+    inflight = null;
+  }
+});
 
 async function loadCurrentUser(): Promise<CurrentUserData> {
   const { data: sesh } = await supabase.auth.getSession();
@@ -43,7 +55,11 @@ export function useCurrentUser() {
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
+    // If cached user matches current auth session, use it
     if (cachedUser && cachedToken) {
+      setUser(cachedUser);
+      setToken(cachedToken);
+      setLoading(false);
       return;
     }
     let mounted = true;

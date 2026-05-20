@@ -19,7 +19,6 @@ from slowapi.errors import RateLimitExceeded
 load_dotenv()
 
 from middleware.auth import get_current_user, UserSession, require_leader, require_member, require_superadmin
-from middleware.anonymizer import anonymizer_engine
 import db
 
 # Production logging
@@ -103,8 +102,8 @@ def _cached_org_quota(tenant_id: str) -> dict:
     return org_quota_cache.get_or_set(tenant_id, lambda: db.get_org_quota_snapshot(tenant_id))
 
 
-def _cached_companies() -> list[dict]:
-    return companies_cache.get_or_set("all", db.list_all_tenants)
+def _cached_companies() -> dict:
+    return companies_cache.get_or_set("all", lambda: db.list_all_tenants(limit=100))
 
 
 def _cached_global_usage() -> dict:
@@ -170,11 +169,10 @@ class MediationPayload(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list)
     system_prompt: str | None = Field(default=None, max_length=2000)
     max_tokens: int = Field(default=1024, ge=256, le=4096)
-    pii_rules: list[str] = Field(default_factory=list)
 
 
 class MediationResponse(BaseModel):
-    sanitized_prompt_preview: str
+    prompt_preview: str
     ai_response: str
     tokens_processed: int
     model: str
@@ -243,16 +241,11 @@ async def _run_ai_mediation(
     history: list[dict] | None = None,
     system_prompt: str | None = None,
     max_tokens: int = 1024,
-    pii_rules: list[str] | None = None,
 ) -> MediationResponse:
     """Core mediation logic shared by JSON and multipart endpoints."""
     start_time = time.time()
 
-    # 1. Anonymize (with optional per-request PII rule filtering)
-    enabled_rules = pii_rules if pii_rules else None
-    anonymized_text = anonymizer_engine.sanitize_prompt(prompt, enabled_rules=enabled_rules)
-
-    # 2. Forward to AWS Bedrock
+    # Forward to AWS Bedrock
     has_aws = AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_ACCESS_KEY_ID != "your-aws-access-key"
 
     ai_response = ""
@@ -260,8 +253,7 @@ async def _run_ai_mediation(
     out_tokens = 0
     tot_tokens = 0
 
-    # Build message history with English + structured markdown instruction
-    # Use custom system prompt from Vault if provided, otherwise use default
+    # Build message history
     default_system = (
         "You must respond in English only. Be concise and helpful. "
         "Use Markdown formatting for structure: headings, bullet lists, numbered lists, "
@@ -269,22 +261,22 @@ async def _run_ai_mediation(
         "Always wrap code in fenced code blocks with the correct language identifier."
     )
     effective_system = system_prompt.strip() if system_prompt else default_system
+    logger.info("System prompt: %s", effective_system[:100])
     messages = [{"role": "system", "content": effective_system}]
     if history:
-        # Keep last 10 messages to stay within context window
         for msg in history[-10:]:
             if isinstance(msg, dict) and "role" in msg and "content" in msg:
                 messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": anonymized_text})
+    messages.append({"role": "user", "content": prompt})
 
     if not has_aws:
         in_tokens = sum(len(m["content"].split()) for m in messages)
         out_tokens = 128
         tot_tokens = in_tokens + out_tokens
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         ai_response = (
-            f"[MOCK RESPONSE] Anonymizer Core received sanitized prompt:\n\n"
-            f"{anonymized_text}\n\n"
+            f"[MOCK RESPONSE] Received prompt:\n\n"
+            f"{prompt[:200]}{'...' if len(prompt) > 200 else ''}\n\n"
             f"[No AWS Bedrock credentials configured. This is a mock response for testing.]"
         )
     else:
@@ -301,33 +293,47 @@ async def _run_ai_mediation(
             "messages": messages,
         }
 
-        # ── Credit quota enforcement ──
-        # Estimate input tokens (~4 chars per token for English)
-        estimated_input = len(anonymized_text) // 4 + 1
+        # ── Atomic credit reservation ──
+        # Estimate cost and reserve credits in a single atomic transaction
+        estimated_input = len(prompt) // 4 + 1
         estimated_credits = db.estimate_request_credits(
             model_id,
             estimated_input_tokens=estimated_input,
             estimated_output_tokens=max_tokens,
         )
-        allowed, reason = db.check_credit_quota(
+        reservation = db.reserve_credits(
             current_user.user_id,
             current_user.tenant_id,
-            incoming_credits=estimated_credits,
+            estimated_credits,
+            is_admin=current_user.is_platform_admin,
         )
-        if not allowed:
-            logger.warning("Quota blocked: user=%s tenant=%s reason=%s", current_user.user_id, current_user.tenant_id, reason)
+        if not reservation["allowed"]:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=reason,
+                detail=reservation["reason"],
             )
 
         try:
-            response = client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(body),
-                contentType="application/json",
-                accept="application/json",
-            )
+            # Retry with exponential backoff on throttling
+            response = None
+            for attempt in range(3):
+                try:
+                    response = client.invoke_model(
+                        modelId=model_id,
+                        body=json.dumps(body),
+                        contentType="application/json",
+                        accept="application/json",
+                    )
+                    break
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "")
+                    if error_code in ("ThrottlingException", "TooManyRequestsException") and attempt < 2:
+                        wait = (2 ** attempt) + 0.5
+                        logger.warning("Bedrock throttled (attempt %d/3), retrying in %.1fs", attempt + 1, wait)
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+
             response_body = json.loads(response["body"].read().decode("utf-8"))
 
             # Robust response parsing
@@ -349,10 +355,15 @@ async def _run_ai_mediation(
                 logger.warning("Empty AI response. Raw: %s", json.dumps(response_body)[:500])
 
             usage = response_body.get("usage", {})
-            in_tokens = usage.get("input_tokens", usage.get("prompt_tokens", len(anonymized_text.split())))
+            in_tokens = usage.get("input_tokens", usage.get("prompt_tokens", len(prompt.split())))
             out_tokens = usage.get("output_tokens", usage.get("completion_tokens", 128))
             tot_tokens = usage.get("total_tokens", in_tokens + out_tokens)
         except ClientError as e:
+            # Release reserved credits on upstream failure
+            db.release_reserved_credits(
+                current_user.user_id,
+                reservation["reserved_credits"],
+            )
             logger.error("AWS Bedrock error: %s", e)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -361,8 +372,24 @@ async def _run_ai_mediation(
 
     duration = int((time.time() - start_time) * 1000)
 
-    # 3. Log telemetry & consume credits
-    actual_credits = db.calculate_request_credits(model or model_id, in_tokens, out_tokens)
+    # Finalize credit consumption
+    actual_credits = db.calculate_request_credits(model or AWS_BEDROCK_MODEL, in_tokens, out_tokens)
+    if has_aws and not current_user.is_platform_admin:
+        # Settle: deduct actual, release any over-reservation
+        db.settle_credits(
+            current_user.user_id,
+            current_user.tenant_id,
+            reserved=reservation["reserved_credits"],
+            actual=actual_credits,
+        )
+    elif not has_aws and not current_user.is_platform_admin:
+        # Mock mode: just consume directly (no reservation was made)
+        try:
+            db.consume_user_credits(current_user.user_id, current_user.tenant_id, actual_credits)
+        except (ValueError, Exception):
+            pass  # Mock mode, don't block
+
+    # Log telemetry
     db.save_usage_metric(
         tenant_id=current_user.tenant_id,
         supabase_auth_id=current_user.user_id,
@@ -373,30 +400,18 @@ async def _run_ai_mediation(
         duration_ms=duration,
         credits_used=actual_credits,
     )
-    try:
-        consumption = db.consume_user_credits(current_user.user_id, current_user.tenant_id, actual_credits)
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Insufficient credits. Please ask a leader to top up.")
-    except Exception as exc:
-        logger.exception(
-            "Failed to deduct credits after mediation: user=%s tenant=%s err=%s",
-            current_user.user_id,
-            current_user.tenant_id,
-            str(exc),
-        )
-        raise HTTPException(status_code=500, detail="Usage recorded but quota update failed. Contact support.")
 
     logger.info(
-        "Telemetry: tenant=%s model=%s tokens=%d credits=%d paid=%d",
+        "Mediation: tenant=%s model=%s tokens=%d credits=%d duration=%dms",
         current_user.tenant_id,
         model,
         tot_tokens,
-        consumption["credits_consumed"],
-        consumption.get("paid_credit_consumed", 0),
+        actual_credits,
+        duration,
     )
 
     return MediationResponse(
-        sanitized_prompt_preview=anonymized_text[:100],
+        prompt_preview=prompt[:100],
         ai_response=ai_response,
         tokens_processed=tot_tokens,
         model=model,
@@ -420,7 +435,6 @@ async def execute_anonymous_brokerage(
         history=history,
         system_prompt=payload.system_prompt,
         max_tokens=payload.max_tokens,
-        pii_rules=payload.pii_rules if payload.pii_rules else None,
     )
 
 
@@ -433,14 +447,12 @@ async def execute_upload_brokerage(
     history: str = Form(default="[]"),
     system_prompt: str | None = Form(default=None),
     max_tokens: int = Form(default=1024),
-    pii_rules: str = Form(default=""),
     file: UploadFile = File(None),
     current_user: UserSession = Depends(get_current_user),
 ):
     """Mediation with optional document upload (PDF, DOCX, TXT, MD)."""
     full_prompt = prompt
     if file and file.filename:
-        # Run file processing in threadpool so the event loop is not blocked
         try:
             content = await asyncio.get_event_loop().run_in_executor(None, file.file.read)
         except Exception as e:
@@ -462,13 +474,6 @@ async def execute_upload_brokerage(
     except json.JSONDecodeError:
         history_list = []
 
-    try:
-        pii_list = json.loads(pii_rules) if pii_rules else []
-        if not isinstance(pii_list, list):
-            pii_list = []
-    except json.JSONDecodeError:
-        pii_list = []
-
     return await _run_ai_mediation(
         full_prompt,
         model,
@@ -476,7 +481,6 @@ async def execute_upload_brokerage(
         history=history_list,
         system_prompt=system_prompt,
         max_tokens=max_tokens,
-        pii_rules=pii_list if pii_list else None,
     )
 
 
@@ -559,6 +563,44 @@ async def get_current_user_info(
         "role": profile["role"],
         "is_platform_admin": profile["is_platform_admin"],
     }
+
+
+class UpdatePreferencesPayload(BaseModel):
+    preferred_model: str | None = None
+    system_prompt: str | None = None
+    max_tokens: int | None = Field(default=None, ge=256, le=4096)
+
+
+@app.get("/api/v1/me/preferences")
+@limiter.limit("60/minute")
+async def get_my_preferences(
+    request: Request,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Return user's AI preferences (model, system prompt, max tokens)."""
+    prefs = db.get_user_preferences(current_user.user_id)
+    return prefs
+
+
+@app.patch("/api/v1/me/preferences")
+@limiter.limit("30/minute")
+async def update_my_preferences(
+    request: Request,
+    payload: UpdatePreferencesPayload,
+    current_user: UserSession = Depends(get_current_user),
+):
+    """Update user's AI preferences."""
+    updates = {}
+    if payload.preferred_model is not None:
+        updates["preferred_model"] = payload.preferred_model
+    if payload.system_prompt is not None:
+        updates["system_prompt"] = payload.system_prompt
+    if payload.max_tokens is not None:
+        updates["max_tokens"] = payload.max_tokens
+    if not updates:
+        return {"status": "no changes"}
+    result = db.update_user_preferences(current_user.user_id, updates)
+    return result
 
 
 @app.get("/api/v1/me/usage")
@@ -644,11 +686,6 @@ class EstimateCostPayload(BaseModel):
     max_tokens: int = Field(default=4000, ge=1, le=8000)
 
 
-class CheckQuotaPayload(BaseModel):
-    estimated_input_tokens: int = Field(..., ge=1, le=100000)
-    estimated_output_tokens: int = Field(..., ge=1, le=100000)
-
-
 class DummyCardPayload(BaseModel):
     number: str = Field(..., min_length=16, max_length=16)
     exp_month: int = Field(..., ge=1, le=12)
@@ -688,7 +725,6 @@ async def estimate_cost(
         "daily_remaining": user_quota["daily_remaining"],
         "extra_remaining": user_quota["extra_remaining"],
         "total_available": user_quota["total_available"],
-        "soft_available": user_quota["soft_available"],
         "warning_level": user_quota["warning_level"],
         "sufficient": estimated_credits <= user_quota["total_available"],
     }
@@ -734,7 +770,8 @@ async def get_dashboard_summary(
         payload["org_quota"] = _cached_org_quota(tenant_id)
 
     if is_superadmin:
-        payload["companies"] = _cached_companies()
+        companies_data = _cached_companies()
+        payload["companies"] = companies_data.get("companies", [])
         payload["global_usage"] = _cached_global_usage()
 
     return payload
@@ -750,40 +787,31 @@ async def get_org_quota(
     return _cached_org_quota(current_user.tenant_id)
 
 
-@app.post("/api/v1/admin/tenants/{tenant_id}/extra-tokens")
+class OrgSettingsPayload(BaseModel):
+    auto_pool_draw: bool
+
+
+@app.patch("/api/v1/org/settings")
 @limiter.limit("30/minute")
-async def admin_add_org_extra_tokens(
+async def update_org_settings(
     request: Request,
-    tenant_id: str,
-    payload: AddExtraPayload,
-    current_user: UserSession = Depends(require_superadmin),
+    payload: OrgSettingsPayload,
+    current_user: UserSession = Depends(require_leader),
 ):
-    """Add extra credits to an org's pool. Superadmin only."""
-    result = db.add_org_extra_credits(tenant_id, payload.amount, current_user.user_id, "Manual adjustment")
+    """Toggle org settings like auto-pool-draw. Leaders only."""
+    result = db.set_auto_pool_draw(current_user.tenant_id, payload.auto_pool_draw)
     return result
 
 
-@app.post("/api/v1/admin/tenants/{tenant_id}/topup")
-@limiter.limit("30/minute")
-async def admin_topup_tenant(
+@app.get("/api/v1/org/settings")
+@limiter.limit("60/minute")
+async def get_org_settings(
     request: Request,
-    tenant_id: str,
-    payload: TopUpPayload,
-    current_user: UserSession = Depends(require_superadmin),
+    current_user: UserSession = Depends(require_leader),
 ):
-    """Simulate a credit purchase via dummy card input."""
-    card_number = payload.card.number
-    if not card_number.isdigit() or len(card_number) != 16:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid card number")
-    if set(card_number) != {"0"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Test mode only accepts 0000 0000 0000 0000")
-    result = db.add_org_extra_credits(
-        tenant_id,
-        payload.amount,
-        current_user.user_id,
-        payload.note or "Dummy card top-up",
-    )
-    return {"status": "success", "extra_token_pool": result["extra_token_pool"], "note": payload.note or "Dummy card top-up"}
+    """Get org settings. Leaders only."""
+    usage = db.get_org_token_usage(current_user.tenant_id)
+    return {"auto_pool_draw": usage.get("auto_pool_draw", False)}
 
 
 @app.get("/api/v1/admin/topups")
@@ -879,11 +907,14 @@ class UpdateRolePayload(BaseModel):
 @limiter.limit("60/minute")
 async def list_org_members(
     request: Request,
+    search: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     current_user: UserSession = Depends(get_current_user),
 ):
-    """List all members of the current user's org."""
-    members = db.list_org_members(current_user.tenant_id)
-    return {"members": members}
+    """List members of the current user's org with pagination."""
+    result = db.list_org_members(current_user.tenant_id, search=search, limit=limit, offset=offset)
+    return result
 
 
 @app.post("/api/v1/org/invite")
@@ -995,11 +1026,16 @@ class AssignLeaderPayload(BaseModel):
 @limiter.limit("30/minute")
 async def admin_list_companies(
     request: Request,
+    search: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("created_at"),
+    sort_dir: str = Query("desc"),
     current_user: UserSession = Depends(require_superadmin),
 ):
-    """List all tenants. Superadmin only."""
-    tenants = db.list_all_tenants()
-    return {"companies": tenants}
+    """List all tenants with pagination and search. Superadmin only."""
+    result = db.list_all_tenants(search=search, limit=limit, offset=offset, sort_by=sort_by, sort_dir=sort_dir)
+    return result
 
 
 @app.post("/api/v1/admin/companies")
@@ -1054,11 +1090,15 @@ async def admin_assign_leader(
 @limiter.limit("30/minute")
 async def admin_list_all_users(
     request: Request,
+    search: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    role: str | None = None,
     current_user: UserSession = Depends(require_superadmin),
 ):
-    """List all users across all companies. Superadmin only."""
-    users = db.list_all_users()
-    return {"users": users}
+    """List all users with pagination and search. Superadmin only."""
+    result = db.list_all_users(search=search, limit=limit, offset=offset, role_filter=role)
+    return result
 
 
 @app.patch("/api/v1/admin/users/{profile_id}/role")
@@ -1239,9 +1279,10 @@ async def accept_invite_endpoint(
         payload.token,
         current_user.user_id,
         current_user.email,
+        user_email=current_user.email,
     )
     if not result:
-        raise HTTPException(status_code=404, detail="Invalid or expired invite.")
+        raise HTTPException(status_code=403, detail="Invalid invite, expired, or email mismatch.")
     return {
         "status": "accepted",
         "tenant_id": result["tenant_id"],

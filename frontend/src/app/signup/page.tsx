@@ -18,6 +18,7 @@ export default function SignupPage() {
   const [inviteToken, setInviteToken] = useState<string | null>(null);
   const [checkingInvite, setCheckingInvite] = useState(true);
   const [inviteValid, setInviteValid] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState<string | null>(null);
 
   // Gate signup behind a valid invite token
   useEffect(() => {
@@ -31,7 +32,13 @@ export default function SignupPage() {
       try {
         const res = await fetch(`/api/invite/validate?token=${encodeURIComponent(token)}`);
         if (res.ok) {
+          const data = await res.json();
           setInviteValid(true);
+          // Lock email to the one specified in the invite
+          if (data.email) {
+            setInviteEmail(data.email);
+            setEmail(data.email);
+          }
         } else {
           localStorage.removeItem("pending_invite_token");
           setInviteToken(null);
@@ -83,8 +90,25 @@ export default function SignupPage() {
     } else if (data.session) {
       // Auto-login when email confirmation is disabled
       document.cookie = `sb-access-token=${data.session.access_token}; path=/; max-age=604800`;
-      router.push("/join");
+      // Auto-accept the invite immediately after signup
+      try {
+        const acceptRes = await fetch("/api/invite/accept", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${data.session.access_token}` },
+          body: JSON.stringify({ token: inviteToken }),
+        });
+        if (acceptRes.ok) {
+          localStorage.removeItem("pending_invite_token");
+          router.push("/console");
+        } else {
+          // Fallback: redirect to /join to accept manually
+          router.push("/join");
+        }
+      } catch {
+        router.push("/join");
+      }
     } else if (data.user) {
+      // Email confirmation required — show success message
       setSuccess(true);
     }
 
@@ -97,9 +121,9 @@ export default function SignupPage() {
       <div className="fixed inset-0 z-0 pointer-events-none bg-gradient-to-b from-transparent to-surface-container-lowest" />
 
       <header className="relative z-20 w-full flex justify-between items-center h-16 px-8 max-w-[1440px] mx-auto border-b border-outline-variant/10">
-        <div className="font-mono text-xs font-semibold tracking-[0.1em] text-primary uppercase flex items-center gap-2">
-          <Terminal className="w-[18px] h-[18px]" />
-          Anonymizer Core
+        <div className="flex items-center gap-2 text-primary">
+          <img src="/logo.png" alt="Quintal AI" className="w-8 h-8 object-contain" />
+          <span className="font-sans text-base font-semibold">Quintal AI</span>
         </div>
       </header>
 
@@ -184,10 +208,11 @@ export default function SignupPage() {
                       <input
                         type="email"
                         value={email}
-                        onChange={(e) => setEmail(e.target.value)}
+                        onChange={(e) => !inviteEmail && setEmail(e.target.value)}
                         placeholder="operator@enterprise.com"
-                        className="bg-surface-dim border border-outline-variant/30 rounded-lg pl-11 pr-4 py-3 font-mono text-sm text-on-surface placeholder:text-outline-variant/50 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all w-full shadow-inner"
+                        className={`bg-surface-dim border border-outline-variant/30 rounded-lg pl-11 pr-4 py-3 font-mono text-sm text-on-surface placeholder:text-outline-variant/50 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all w-full shadow-inner ${inviteEmail ? "opacity-70 cursor-not-allowed" : ""}`}
                         required
+                        readOnly={!!inviteEmail}
                       />
                     </div>
                   </div>
@@ -268,7 +293,7 @@ export default function SignupPage() {
       <footer className="relative z-20 bg-surface-container-lowest w-full py-8 mt-auto border-t border-outline-variant/10">
         <div className="flex flex-col md:flex-row justify-between items-center px-8 max-w-[1440px] mx-auto gap-4">
           <div className="font-mono text-xs font-semibold tracking-[0.1em] text-outline uppercase">
-            &copy; 2024 Anonymizer Core. Encrypted by Default.
+            &copy; 2024 Quintal AI. Enterprise AI Platform.
           </div>
         </div>
       </footer>

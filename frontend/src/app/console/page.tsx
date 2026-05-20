@@ -47,8 +47,6 @@ const MODELS = [
   { id: "amazon.titan-text-premier-v1:0", label: "Titan Text Premier", provider: "AWS Bedrock" },
 ];
 
-const SELECTED_MODEL_KEY = "anonymizer_selected_model";
-
 function createNewSession(title = "New Session", id?: string): ChatSession {
   const now = new Date().toISOString();
   return {
@@ -71,14 +69,7 @@ export default function ConsolePage() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(() => {
-    try {
-      const saved = localStorage.getItem(SELECTED_MODEL_KEY);
-      return saved && MODELS.some((m) => m.id === saved) ? saved : MODELS[0].id;
-    } catch {
-      return MODELS[0].id;
-    }
-  });
+  const [selectedModel, setSelectedModel] = useState(MODELS[0].id);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [costEstimate, setCostEstimate] = useState<{ estimated_credits: number; total_available: number; sufficient: boolean; warning_level?: string } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -87,32 +78,66 @@ export default function ConsolePage() {
 
   const [apiLoading, setApiLoading] = useState(true);
   const [apiError, setApiError] = useState("");
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const [userSystemPrompt, setUserSystemPrompt] = useState("");
+  const [userMaxTokens, setUserMaxTokens] = useState(1024);
 
-  // Load sessions from API on mount
+  // Reload preferences when page becomes visible (e.g., after saving in Settings)
   useEffect(() => {
+    const handleFocus = async () => {
+      const token = await getAuthToken();
+      if (!token) return;
+      const res = await fetch("/api/me/preferences", { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) {
+        const prefs = await res.json();
+        if (prefs.preferred_model && MODELS.some((m) => m.id === prefs.preferred_model)) {
+          setSelectedModel(prefs.preferred_model);
+        }
+        setUserSystemPrompt(prefs.system_prompt || "");
+        setUserMaxTokens(prefs.max_tokens || 1024);
+      }
+    };
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
+  }, []);
+
+  // Load preferences + sessions on mount (single effect, with cancellation to prevent StrictMode double-call)
+  useEffect(() => {
+    let cancelled = false;
     async function loadFromApi() {
       try {
         const token = await getAuthToken();
-        if (!token) {
-          setApiLoading(false);
-          return;
+        if (!token || cancelled) { setApiLoading(false); return; }
+
+        // Load preferences and sessions in parallel
+        const [prefsRes, sessionsRes] = await Promise.all([
+          fetch("/api/me/preferences", { headers: { Authorization: `Bearer ${token}` } }),
+          fetch("/api/sessions", { headers: { Authorization: `Bearer ${token}` } }),
+        ]);
+        if (cancelled) return;
+
+        if (prefsRes.ok) {
+          const prefs = await prefsRes.json();
+          if (prefs.preferred_model && MODELS.some((m) => m.id === prefs.preferred_model)) {
+            setSelectedModel(prefs.preferred_model);
+          }
+          if (prefs.system_prompt) setUserSystemPrompt(prefs.system_prompt);
+          if (prefs.max_tokens) setUserMaxTokens(prefs.max_tokens);
         }
-        const res = await fetch("/api/sessions", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!res.ok) throw new Error("Failed to load sessions");
-        const data = await res.json();
+
+        if (!sessionsRes.ok) throw new Error("Failed to load sessions");
+        const data = await sessionsRes.json();
+        if (cancelled) return;
         const apiSessions: ApiSession[] = data.sessions || [];
+
         if (apiSessions.length === 0) {
-          // Create first session via API
           const createRes = await fetch("/api/sessions", {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-            },
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
             body: JSON.stringify({ title: "Session 1", model_id: selectedModel }),
           });
+          if (cancelled) return;
           if (!createRes.ok) throw new Error("Failed to create session");
           const createData = await createRes.json();
           const s = createData.session as ApiSession;
@@ -120,49 +145,85 @@ export default function ConsolePage() {
           setSessions([first]);
           setActiveSessionId(first.id);
         } else {
-          // Fetch messages for each session
-          const fullSessions: ChatSession[] = [];
-          for (const s of apiSessions) {
-            const detailRes = await fetch(`/api/sessions/${s.id}`, {
-              headers: { Authorization: `Bearer ${token}` },
-            });
-            if (!detailRes.ok) continue;
+          const fullSessions: ChatSession[] = apiSessions.map((s) => ({
+            id: s.id, title: s.title, messages: [], createdAt: s.created_at, updatedAt: s.updated_at,
+          }));
+          setSessions(fullSessions);
+          const activeId = fullSessions[0].id;
+          setActiveSessionId(activeId);
+          // Load messages for active session only
+          const detailRes = await fetch(`/api/sessions/${activeId}`, { headers: { Authorization: `Bearer ${token}` } });
+          if (cancelled) return;
+          if (detailRes.ok) {
             const detail = await detailRes.json();
             const apiS = detail.session as ApiSession;
-            fullSessions.push({
-              id: apiS.id,
-              title: apiS.title,
-              messages: (apiS.messages || []).map((m) => ({
-                role: m.role,
-                content: m.content,
-                timestamp: m.created_at,
-              })),
-              createdAt: apiS.created_at,
-              updatedAt: apiS.updated_at,
-            });
-          }
-          setSessions(fullSessions);
-          if (fullSessions.length > 0) {
-            setActiveSessionId(fullSessions[0].id);
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.id === activeId
+                  ? { ...s, messages: (apiS.messages || []).map((m) => ({ role: m.role, content: m.content, timestamp: m.created_at })) }
+                  : s
+              )
+            );
           }
         }
       } catch (err) {
-        setApiError(err instanceof Error ? err.message : "Unknown error");
+        if (!cancelled) setApiError(err instanceof Error ? err.message : "Unknown error");
       } finally {
-        setApiLoading(false);
+        if (!cancelled) setApiLoading(false);
       }
     }
     loadFromApi();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
   }, []);
 
-  // Persist selected model
+  // Save model preference to DB when changed (debounced, skip initial)
+  const modelInitRef = useRef(true);
   useEffect(() => {
-    localStorage.setItem(SELECTED_MODEL_KEY, selectedModel);
+    if (modelInitRef.current) { modelInitRef.current = false; return; }
+    const timer = setTimeout(async () => {
+      const t = await getAuthToken();
+      if (!t) return;
+      fetch("/api/me/preferences", {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ preferred_model: selectedModel }),
+      });
+    }, 500);
+    return () => clearTimeout(timer);
   }, [selectedModel]);
+
+  const handleSwitchSession = useCallback(async (sessionId: string) => {
+    setActiveSessionId(sessionId);
+    // Load messages if not already loaded
+    const session = sessions.find((s) => s.id === sessionId);
+    if (session && session.messages.length === 0) {
+      const token = await getAuthToken();
+      if (!token) return;
+      const res = await fetch(`/api/sessions/${sessionId}`, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.ok) {
+        const detail = await res.json();
+        const apiS = detail.session as ApiSession;
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === sessionId
+              ? { ...s, messages: (apiS.messages || []).map((m: ApiMessage) => ({ role: m.role, content: m.content, timestamp: m.created_at })) }
+              : s
+          )
+        );
+      }
+    }
+  }, [sessions]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
   const messages = activeSession?.messages || [];
+
+  // Auto-scroll to bottom when messages change or session switches
+  useEffect(() => {
+    setTimeout(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }, 100);
+  }, [messages.length, activeSessionId]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -184,18 +245,10 @@ export default function ConsolePage() {
       try {
         const token = await getAuthToken();
         if (!token) return;
-        let vaultMaxTokens = 1024;
-        try {
-          const raw = localStorage.getItem("anonymizer_vault_config");
-          if (raw) {
-            const vault = JSON.parse(raw);
-            if (vault.maxTokens) vaultMaxTokens = vault.maxTokens;
-          }
-        } catch { /* ignore */ }
         const res = await fetch("/api/me/estimate-cost", {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: trimmed, model: selectedModel, max_tokens: vaultMaxTokens }),
+          body: JSON.stringify({ prompt: trimmed, model: selectedModel, max_tokens: userMaxTokens }),
         });
         if (res.ok) {
           const data = await res.json();
@@ -274,6 +327,23 @@ export default function ConsolePage() {
     }
   };
 
+  const handleRenameSession = async (id: string) => {
+    const newTitle = editingTitle.trim();
+    if (!newTitle) { setEditingSessionId(null); return; }
+    try {
+      const token = await getAuthToken();
+      if (token) {
+        await fetch(`/api/sessions/${id}`, {
+          method: "PATCH",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ title: newTitle }),
+        });
+      }
+    } catch { /* ignore */ }
+    setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title: newTitle } : s));
+    setEditingSessionId(null);
+  };
+
   async function saveMessageToApi(sessionId: string, role: "user" | "assistant", content: string) {
     try {
       const token = await getAuthToken();
@@ -310,29 +380,25 @@ export default function ConsolePage() {
     // Build history before adding current message
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
 
-    // Read Vault settings from localStorage (set in /vault page)
-    let vaultSystemPrompt = "";
-    let vaultMaxTokens = 1024;
-    let vaultPiiRules: string[] = [];
-    try {
-      const raw = localStorage.getItem("anonymizer_vault_config");
-      if (raw) {
-        const vault = JSON.parse(raw);
-        if (vault.systemPrompt) vaultSystemPrompt = vault.systemPrompt;
-        if (vault.maxTokens) vaultMaxTokens = vault.maxTokens;
-        if (vault.piiRules && Array.isArray(vault.piiRules)) {
-          vaultPiiRules = vault.piiRules.filter((r: { enabled: boolean; id: string }) => r.enabled).map((r: { id: string }) => r.id);
-        }
-      }
-    } catch {
-      /* ignore corrupt vault config */
-    }
+    // Use preferences from DB
+    const systemPrompt = userSystemPrompt;
+    const maxTokens = userMaxTokens;
 
-    // Add user message to UI and persist to API
-    updateSessionMessages(activeSessionId, (prev) => [...prev, userMsg]);
-    await saveMessageToApi(activeSessionId, "user", displayContent);
+    // Clear input immediately
     setInput("");
     setIsProcessing(true);
+
+    // Add user message to UI
+    updateSessionMessages(activeSessionId, (prev) => [...prev, userMsg]);
+
+    // Scroll to bottom immediately after user message
+    setTimeout(() => {
+      const el = scrollRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    }, 50);
+
+    // Persist to API in background (don't await)
+    saveMessageToApi(activeSessionId, "user", displayContent);
 
     try {
       const { data: sessionData } = await supabase.auth.getSession();
@@ -345,9 +411,8 @@ export default function ConsolePage() {
         formData.append("prompt", trimmed);
         formData.append("model", selectedModel);
         formData.append("history", JSON.stringify(history));
-        if (vaultSystemPrompt) formData.append("system_prompt", vaultSystemPrompt);
-        formData.append("max_tokens", String(vaultMaxTokens));
-        if (vaultPiiRules.length > 0) formData.append("pii_rules", JSON.stringify(vaultPiiRules));
+        if (systemPrompt) formData.append("system_prompt", systemPrompt);
+        formData.append("max_tokens", String(maxTokens));
         formData.append("file", selectedFile);
 
         res = await fetch("/api/mediate", {
@@ -364,10 +429,9 @@ export default function ConsolePage() {
           prompt: trimmed,
           model: selectedModel,
           history,
-          max_tokens: vaultMaxTokens,
+          max_tokens: maxTokens,
         };
-        if (vaultSystemPrompt) body.system_prompt = vaultSystemPrompt;
-        if (vaultPiiRules.length > 0) body.pii_rules = vaultPiiRules;
+        if (systemPrompt) body.system_prompt = systemPrompt;
 
         res = await fetch("/api/mediate", {
           method: "POST",
@@ -449,7 +513,7 @@ export default function ConsolePage() {
 
   return (
     <AppShell>
-      <div className="flex h-[calc(100vh-8rem)] -mx-6 md:-mx-8 -mt-6 md:-mt-6">
+      <div className="flex h-[calc(100vh-3rem)] -mx-6 md:-mx-8 -mt-6 -mb-8">
         {/* Sidebar */}
         <AnimatePresence initial={false}>
           {sidebarOpen && (
@@ -472,25 +536,53 @@ export default function ConsolePage() {
               </div>
               <div className="flex-1 overflow-y-auto p-2 space-y-1">
                 {sessions.map((session) => (
-                  <button
+                  <div
                     key={session.id}
-                    onClick={() => setActiveSessionId(session.id)}
-                    className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-all group flex items-center gap-2 ${
+                    onClick={() => handleSwitchSession(session.id)}
+                    className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-all group flex items-center gap-2 cursor-pointer ${
                       session.id === activeSessionId
                         ? "bg-primary/10 border border-primary/20 text-on-surface"
                         : "border border-transparent text-on-surface-variant hover:bg-surface-container/40 hover:text-on-surface"
                     }`}
                   >
                     <MessageSquare className="w-4 h-4 shrink-0 opacity-60" />
-                    <span className="truncate flex-1">{session.title}</span>
-                    <span className="text-[10px] font-mono opacity-40">{formatTime(session.updatedAt)}</span>
-                    {sessions.length > 1 && (
-                      <Trash2
-                        className="w-3.5 h-3.5 text-outline-variant opacity-0 group-hover:opacity-60 hover:text-error hover:opacity-100 transition-all shrink-0 cursor-pointer"
-                        onClick={(e) => handleDeleteSession(session.id, e)}
+                    {editingSessionId === session.id ? (
+                      <input
+                        autoFocus
+                        value={editingTitle}
+                        onChange={(e) => setEditingTitle(e.target.value)}
+                        onBlur={() => handleRenameSession(session.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handleRenameSession(session.id);
+                          if (e.key === "Escape") setEditingSessionId(null);
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        className="flex-1 bg-surface-container-low/50 border border-primary/30 rounded px-1.5 py-0.5 text-xs text-on-surface focus:outline-none"
                       />
+                    ) : (
+                      <span
+                        className="truncate flex-1"
+                        onDoubleClick={(e) => {
+                          e.stopPropagation();
+                          setEditingSessionId(session.id);
+                          setEditingTitle(session.title);
+                        }}
+                      >
+                        {session.title}
+                      </span>
                     )}
-                  </button>
+                    {editingSessionId !== session.id && (
+                      <>
+                        <span className="text-[10px] font-mono opacity-40">{formatTime(session.updatedAt)}</span>
+                        {sessions.length > 1 && (
+                          <Trash2
+                            className="w-3.5 h-3.5 text-outline-variant opacity-0 group-hover:opacity-60 hover:text-error hover:opacity-100 transition-all shrink-0 cursor-pointer"
+                            onClick={(e) => handleDeleteSession(session.id, e)}
+                          />
+                        )}
+                      </>
+                    )}
+                  </div>
                 ))}
               </div>
             </motion.aside>
@@ -545,13 +637,10 @@ export default function ConsolePage() {
                     <Bot className="w-8 h-8 text-primary" />
                   </div>
                   <div>
-                    <h3 className="text-lg font-semibold text-on-surface mb-1">Secure Channel Open</h3>
+                    <h3 className="text-lg font-semibold text-on-surface mb-1">Ready to assist</h3>
                     <p className="text-sm text-on-surface-variant max-w-md">
-                      All prompts are sanitized before transmission. Your identity is decoupled from the payload.
+                      Ask anything. You can also attach documents (PDF, DOCX, TXT) for context-aware responses.
                     </p>
-                  </div>
-                  <div className="font-mono text-xs text-outline mt-4 p-3 rounded-lg bg-surface-container/20 border border-outline-variant/10">
-                    <span className="text-primary">&gt;</span> AWAITING_PROMPT_INPUT
                   </div>
                 </motion.div>
               )}
@@ -577,7 +666,7 @@ export default function ConsolePage() {
                     }`}
                   >
                     {msg.role === "assistant" ? (
-                      <div className="prose prose-sm dark:prose-invert max-w-none">
+                      <div className="prose prose-sm max-w-none prose-p:text-on-surface prose-li:text-on-surface prose-strong:text-on-surface prose-headings:text-on-surface prose-code:text-primary prose-a:text-primary [&_*]:text-on-surface">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
                           {msg.content}
                         </ReactMarkdown>
@@ -598,14 +687,20 @@ export default function ConsolePage() {
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
-                  className="flex gap-3 items-center"
+                  className="flex gap-3 items-start"
                 >
                   <div className="w-8 h-8 rounded-lg bg-surface-container/40 border border-outline-variant/20 flex items-center justify-center">
                     <Bot className="w-4 h-4 text-primary animate-pulse" />
                   </div>
-                  <div className="flex items-center gap-2 px-4 py-3 rounded-xl bg-surface-container/40 border border-outline-variant/20">
-                    <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                    <span className="text-sm text-outline-variant font-mono">Processing through mediation layer...</span>
+                  <div className="px-4 py-3 rounded-xl bg-surface-container/40 border border-outline-variant/20 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <div className="flex gap-1">
+                        <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
+                        <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "150ms" }} />
+                        <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "300ms" }} />
+                      </div>
+                      <span className="text-sm text-on-surface-variant">Analyzing and generating response...</span>
+                    </div>
                   </div>
                 </motion.div>
               )}
@@ -640,17 +735,19 @@ export default function ConsolePage() {
               </button>
               <div className="flex-1 relative">
                 {selectedFile && (
-                  <div className="absolute -top-6 left-0 flex items-center gap-1.5 text-xs text-primary font-mono">
-                    <span className="truncate max-w-[200px]">{selectedFile.name}</span>
+                  <div className="mb-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary/5 border border-primary/20">
+                    <Paperclip className="w-3.5 h-3.5 text-primary" />
+                    <span className="text-xs font-medium text-on-surface truncate max-w-[200px]">{selectedFile.name}</span>
+                    <span className="text-[10px] text-outline font-mono">({(selectedFile.size / 1024).toFixed(0)} KB)</span>
                     <button
                       type="button"
                       onClick={() => {
                         setSelectedFile(null);
                         if (fileInputRef.current) fileInputRef.current.value = "";
                       }}
-                      className="hover:text-error transition-colors"
+                      className="ml-1 p-0.5 rounded hover:bg-error/10 text-outline-variant hover:text-error transition-colors"
                     >
-                      <X className="w-3 h-3" />
+                      <X className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 )}
@@ -664,31 +761,16 @@ export default function ConsolePage() {
                       dispatchPayload(e as unknown as React.FormEvent);
                     }
                   }}
-                  placeholder={selectedFile ? "Ask about the document..." : "Enter sanitized prompt... (Shift+Enter for new line)"}
+                  placeholder={selectedFile ? "Ask about the attached document..." : "Type your message... (Shift+Enter for new line)"}
                   maxLength={10000}
                   rows={1}
                   className="w-full bg-surface-container/40 border border-outline-variant/20 rounded-xl pl-4 pr-12 py-3 text-sm text-on-surface placeholder:text-outline-variant/50 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none overflow-hidden"
                   disabled={isProcessing}
                   style={{ minHeight: "44px" }}
                 />
-                {costEstimate && (
-                  <div className={`absolute -bottom-5 left-0 text-[10px] font-mono flex items-center gap-1.5 ${costEstimate.sufficient ? "text-outline-variant" : "text-error"}`}>
-                    {costEstimate.warning_level && costEstimate.warning_level !== "none" && (
-                      <span className={`w-1.5 h-1.5 rounded-full ${
-                        costEstimate.warning_level === "caution" ? "bg-yellow-400" :
-                        costEstimate.warning_level === "warning" ? "bg-orange-400" :
-                        costEstimate.warning_level === "critical" ? "bg-red-500 animate-pulse" :
-                        "bg-red-500"
-                      }`} />
-                    )}
-                    Est. cost: {costEstimate.estimated_credits.toLocaleString()} credits
-                    {costEstimate.sufficient
-                      ? ` · ${costEstimate.total_available.toLocaleString()} available`
-                      : " · Insufficient credits"}
-                    {costEstimate.warning_level === "caution" && " · Daily usage rising"}
-                    {costEstimate.warning_level === "warning" && " · Daily budget low"}
-                    {costEstimate.warning_level === "critical" && " · Daily overdraft"}
-                    {costEstimate.warning_level === "exhausted" && " · Daily exhausted"}
+                {costEstimate && !costEstimate.sufficient && (
+                  <div className="absolute -bottom-5 left-0 text-[10px] font-mono text-error flex items-center gap-1.5">
+                    Insufficient credits ({costEstimate.total_available} available, need ~{costEstimate.estimated_credits})
                   </div>
                 )}
               </div>

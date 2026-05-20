@@ -13,17 +13,9 @@ export function middleware(request: NextRequest) {
     return NextResponse.redirect(new URL("/console", request.url));
   }
 
-  if (pathname === "/" && token) {
-    return NextResponse.redirect(new URL("/console", request.url));
-  }
-
-  if (pathname === "/" && !token) {
-    return NextResponse.redirect(new URL("/login", request.url));
-  }
-
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: ["/", "/login", "/console/:path*"],
+  matcher: ["/login", "/console/:path*"],
 };

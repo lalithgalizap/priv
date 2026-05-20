@@ -52,6 +52,9 @@ interface OrgUsage {
 export default function OrgPage() {
   const { user, loading: userLoading } = useCurrentUser();
   const [members, setMembers] = useState<OrgMember[]>([]);
+  const [memberTotal, setMemberTotal] = useState(0);
+  const [memberPage, setMemberPage] = useState(0);
+  const [memberSearch, setMemberSearch] = useState("");
   const [invites, setInvites] = useState<OrgInvite[]>([]);
   const [usage, setUsage] = useState<OrgUsage | null>(null);
   const [loading, setLoading] = useState(true);
@@ -71,6 +74,7 @@ export default function OrgPage() {
   const [allocateInput, setAllocateInput] = useState("");
   const [topUpOpen, setTopUpOpen] = useState(false);
   const [topUpSubmitting, setTopUpSubmitting] = useState(false);
+  const [autoPoolDraw, setAutoPoolDraw] = useState(false);
   const [topUpForm, setTopUpForm] = useState({
     amount: "",
     note: "",
@@ -88,6 +92,7 @@ export default function OrgPage() {
     if (quotaRes.ok) {
       const q = await quotaRes.json();
       setOrgExtraPool(q.org?.extra_pool || 0);
+      setAutoPoolDraw(q.org?.auto_pool_draw || false);
       const qmap: Record<string, { daily_budget: number; daily_used: number; daily_remaining: number; extra_allocated: number; extra_used: number; extra_remaining: number; total_available: number }> = {};
       for (const m of q.members || []) {
         qmap[m.supabase_auth_id] = m.quota;
@@ -107,14 +112,18 @@ export default function OrgPage() {
         return;
       }
 
+      const memberParams = new URLSearchParams({ limit: "25", offset: String(memberPage * 25) });
+      if (memberSearch) memberParams.set("search", memberSearch);
+
       const [membersRes, usageRes] = await Promise.all([
-        fetch("/api/org", { headers: { Authorization: `Bearer ${t}` } }),
+        fetch(`/api/org?${memberParams}`, { headers: { Authorization: `Bearer ${t}` } }),
         fetch("/api/org/usage", { headers: { Authorization: `Bearer ${t}` } }),
       ]);
 
       if (membersRes.ok) {
         const m = await membersRes.json();
         setMembers(m.members || []);
+        setMemberTotal(m.total || 0);
       }
 
       if (usageRes.ok) {
@@ -191,6 +200,25 @@ export default function OrgPage() {
     }
     fetchOrgData(user.role);
   }, [mounted, userLoading, user?.id]);
+
+  // Re-fetch members when page or search changes
+  useEffect(() => {
+    if (!mounted || userLoading || !user) return;
+    async function refetchMembers() {
+      const { data: sesh } = await supabase.auth.getSession();
+      const t = sesh.session?.access_token;
+      if (!t) return;
+      const params = new URLSearchParams({ limit: "25", offset: String(memberPage * 25) });
+      if (memberSearch) params.set("search", memberSearch);
+      const res = await fetch(`/api/org?${params}`, { headers: { Authorization: `Bearer ${t}` } });
+      if (res.ok) {
+        const m = await res.json();
+        setMembers(m.members || []);
+        setMemberTotal(m.total || 0);
+      }
+    }
+    refetchMembers();
+  }, [memberPage, memberSearch, mounted, userLoading, user?.id]);
 
   async function handleInvite(e: React.FormEvent) {
     e.preventDefault();
@@ -280,7 +308,7 @@ export default function OrgPage() {
 
   return (
     <AppShell>
-      <div className="max-w-5xl mx-auto px-6 py-8 space-y-6">
+      <div className="w-full space-y-4">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-on-surface">Organization</h1>
@@ -302,14 +330,14 @@ export default function OrgPage() {
 
         {/* Usage Summary */}
         {usage && (
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             {[
               { icon: Activity, label: "Total Tokens", value: usage.total_tokens.toLocaleString() },
               { icon: Users, label: "Active Users (30d)", value: usage.active_users.toString() },
               { icon: TrendingUp, label: "Total Calls", value: usage.total_calls.toLocaleString() },
               { icon: Wallet, label: "Est. Cost", value: `$${usage.compute_cost.toFixed(2)}` },
             ].map((card) => (
-              <div key={card.label} className="glass-panel rounded-xl p-5">
+              <div key={card.label} className="glass-panel rounded-xl p-4">
                 <div className="flex items-center gap-2 mb-2">
                   <card.icon className="w-4 h-4 text-primary" />
                   <span className="text-xs font-mono text-outline-variant uppercase">{card.label}</span>
@@ -320,27 +348,51 @@ export default function OrgPage() {
           </div>
         )}
 
-        {/* Org Extra Pool */}
+        {/* Org Extra Pool + Auto-Draw Toggle */}
         {isLeader && (
-          <div className="glass-panel rounded-xl p-5">
+          <div className="glass-panel rounded-xl p-4">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
                 <Shield className="w-4 h-4 text-primary" />
-                <span className="text-xs font-mono text-outline-variant uppercase">Organization Extra Credit Pool</span>
+                <span className="text-xs font-mono text-outline-variant uppercase">Organization Credit Pool</span>
               </div>
-              <span className="text-xs font-mono text-on-surface">
-                {orgExtraPool.toLocaleString()} credits available to distribute
-              </span>
+              <div className="flex items-center gap-4">
+                <span className="text-sm font-mono text-on-surface font-semibold">
+                  {orgExtraPool.toLocaleString()} credits
+                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-outline-variant">Auto-distribute</span>
+                  <button
+                    onClick={async () => {
+                      const { data: sesh } = await supabase.auth.getSession();
+                      const t = sesh.session?.access_token;
+                      if (!t) return;
+                      const newVal = !autoPoolDraw;
+                      const res = await fetch("/api/org/settings", {
+                        method: "PATCH",
+                        headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
+                        body: JSON.stringify({ auto_pool_draw: newVal }),
+                      });
+                      if (res.ok) setAutoPoolDraw(newVal);
+                    }}
+                    className={`w-10 h-5 rounded-full transition-all relative ${autoPoolDraw ? "bg-secondary" : "bg-outline-variant/40"}`}
+                  >
+                    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-on-primary shadow-sm transition-all ${autoPoolDraw ? "left-5.5" : "left-0.5"}`} style={{ left: autoPoolDraw ? "22px" : "2px" }} />
+                  </button>
+                </div>
+              </div>
             </div>
-            <p className="text-xs font-mono text-outline-variant">
-              Admin adds extra credits here. Leader distributes them to members.
+            <p className="text-xs text-outline-variant">
+              {autoPoolDraw
+                ? "Members who exhaust daily credits will automatically draw from this pool."
+                : "Members must be manually allocated credits. Enable auto-distribute to let them draw from the pool automatically."}
             </p>
           </div>
         )}
 
         {/* Leader Buy Credits */}
         {isLeader && (
-          <div className="glass-panel rounded-xl p-5 space-y-4">
+          <div className="glass-panel rounded-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <CreditCard className="w-4 h-4 text-primary" />
@@ -395,11 +447,22 @@ export default function OrgPage() {
 
         {/* Members Table */}
         <div className="glass-panel rounded-xl overflow-hidden">
-          <div className="px-6 py-4 border-b border-outline-variant/20 flex items-center justify-between">
+          <div className="px-6 py-4 border-b border-outline-variant/20 flex flex-col md:flex-row md:items-center gap-3 justify-between">
             <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-on-surface uppercase">
-              Members
+              Team Members
             </h3>
-            <span className="text-xs text-outline font-mono">{members.length} total</span>
+            <div className="flex items-center gap-3">
+              <div className="relative">
+                <input
+                  type="text"
+                  value={memberSearch}
+                  onChange={(e) => { setMemberSearch(e.target.value); setMemberPage(0); }}
+                  placeholder="Search members..."
+                  className="pl-3 pr-3 py-1.5 text-sm rounded-lg border border-outline-variant/20 bg-surface-container-low/50 text-on-surface placeholder:text-outline-variant/40 focus:outline-none focus:border-primary w-48"
+                />
+              </div>
+              <span className="text-xs text-outline font-mono">{memberTotal} total</span>
+            </div>
           </div>
 
           {loading ? (
@@ -407,106 +470,135 @@ export default function OrgPage() {
               <Loader2 className="w-6 h-6 text-primary animate-spin" />
             </div>
           ) : (
-            <div className="divide-y divide-outline-variant/10">
-              {members.map((m) => (
-                <div
-                  key={m.id}
-                  className="px-6 py-3 flex items-center justify-between hover:bg-surface-container-high/20 transition-colors"
-                >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <Shield className="w-4 h-4 text-outline-variant flex-shrink-0" />
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-on-surface truncate">
-                        {m.display_name || "Unnamed"}
-                      </p>
-                      <p className="text-[10px] font-mono text-outline-variant">
-                        {m.role === "owner" ? "Owner" : m.role}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3 flex-shrink-0">
-                    {/* Credit display for all */}
-                    {(() => {
-                      const q = memberQuotas[m.supabase_auth_id];
-                      if (!q) return null;
-                      return (
-                        <div className="flex flex-col items-end gap-1">
-                          <span className="text-[10px] font-mono text-outline">
-                            Daily: {q.daily_used.toLocaleString()}/{q.daily_budget.toLocaleString()}
-                            {q.extra_allocated > 0 && ` | Extra: ${q.extra_remaining.toLocaleString()}/${q.extra_allocated.toLocaleString()}`}
-                          </span>
-                          <span className={`text-[10px] font-mono ${q.daily_used / q.daily_budget >= 0.9 ? "text-error" : "text-outline"}`}>
-                            {Math.round((q.daily_used / q.daily_budget) * 100)}% of daily cap used
-                          </span>
-                          <span className="text-xs font-mono text-on-surface">
-                            Total: {q.total_available.toLocaleString()}
-                          </span>
-                        </div>
-                      );
-                    })()}
-                    {isLeader && (
-                      <div className="flex items-center gap-2">
-                        {allocatingMember === m.supabase_auth_id ? (
-                          <div className="flex items-center gap-1">
-                            <input
-                              type="number"
-                              value={allocateInput}
-                              onChange={(e) => setAllocateInput(e.target.value)}
-                              placeholder="Amount"
-                              className="w-16 bg-surface-container-low/50 border border-outline-variant/20 rounded px-1.5 py-0.5 text-[10px] font-mono text-on-surface focus:outline-none focus:border-primary"
-                              min={1}
-                            />
-                            <button
-                              onClick={async () => {
-                                const amount = parseInt(allocateInput, 10);
-                                if (!amount || amount <= 0) { setAllocatingMember(null); return; }
-                                const { data: sesh } = await supabase.auth.getSession();
-                                const tok = sesh.session?.access_token;
-                                if (!tok) return;
-                                const res = await fetch(`/api/org/members/${m.supabase_auth_id}/extra-tokens`, {
-                                  method: "POST",
-                                  headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount }),
-                                });
-                                if (res.ok) {
-                                  await refreshQuotas(tok);
-                                } else {
-                                  const errData = await res.json().catch(() => ({}));
-                                  setError(errData.detail || "Failed to allocate extra credits.");
-                                }
-                                setAllocatingMember(null);
-                                setAllocateInput("");
-                              }}
-                              className="text-primary hover:text-secondary transition-colors p-1"
-                              title="Allocate"
-                            >
-                              <Check className="w-3.5 h-3.5" />
-                            </button>
+            <div className="overflow-x-auto">
+              <table className="min-w-full">
+                <thead className="bg-surface-container-high/30">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-[11px] font-mono text-outline uppercase">Member</th>
+                    <th className="px-4 py-3 text-left text-[11px] font-mono text-outline uppercase">Role</th>
+                    <th className="px-4 py-3 text-center text-[11px] font-mono text-outline uppercase">Daily Usage</th>
+                    <th className="px-4 py-3 text-center text-[11px] font-mono text-outline uppercase">Extra Credits</th>
+                    <th className="px-4 py-3 text-right text-[11px] font-mono text-outline uppercase">Available</th>
+                    {isLeader && <th className="px-4 py-3 text-right text-[11px] font-mono text-outline uppercase">Actions</th>}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-outline-variant/10">
+                  {members.map((m) => {
+                    const q = memberQuotas[m.supabase_auth_id];
+                    const dailyPct = q ? Math.min((q.daily_used / q.daily_budget) * 100, 100) : 0;
+                    const barColor = dailyPct >= 90 ? "bg-error" : dailyPct >= 70 ? "bg-tertiary" : "bg-secondary";
+                    const status = !q ? "ok" : q.total_available <= 0 ? "exhausted" : dailyPct >= 90 ? "low" : "ok";
+                    return (
+                      <tr key={m.id} className={`hover:bg-surface-container-high/10 transition-colors ${status === "exhausted" ? "bg-error/5" : status === "low" ? "bg-tertiary/5" : ""}`}>
+                        <td className="px-6 py-4">
+                          <div className="flex items-center gap-2">
+                            <p className="text-sm font-medium text-on-surface">{m.display_name || "Unnamed"}</p>
+                            {status === "exhausted" && <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-error/10 text-error border border-error/20">EXHAUSTED</span>}
+                            {status === "low" && <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-tertiary/10 text-tertiary border border-tertiary/20">LOW</span>}
                           </div>
-                        ) : (
-                          <button
-                            onClick={() => { setAllocatingMember(m.supabase_auth_id); setAllocateInput(""); }}
-                            className="text-[10px] font-mono text-secondary hover:text-secondary/80 border border-secondary/30 px-1.5 py-0.5 rounded transition-colors"
-                            title="Allocate extra credits"
-                          >
-                            +Extra
-                          </button>
+                          <p className="text-[10px] font-mono text-outline-variant mt-0.5">Joined {new Date(m.created_at).toLocaleDateString()}</p>
+                        </td>
+                        <td className="px-4 py-4">
+                          {roleBadge(m.role)}
+                        </td>
+                        <td className="px-4 py-4">
+                          {q ? (
+                            <div className="flex flex-col items-center gap-1.5 min-w-[140px]">
+                              <div className="w-full h-2 bg-surface-container rounded-full overflow-hidden">
+                                <div className={`h-full ${barColor} rounded-full transition-all`} style={{ width: `${dailyPct}%` }} />
+                              </div>
+                              <span className="text-[11px] font-mono text-outline">{q.daily_used} / {q.daily_budget} credits</span>
+                            </div>
+                          ) : <span className="text-xs text-outline">—</span>}
+                        </td>
+                        <td className="px-4 py-4 text-center">
+                          {q && q.extra_allocated > 0 ? (
+                            <div className="flex flex-col items-center gap-0.5">
+                              <span className="text-sm font-mono text-primary font-medium">{q.extra_remaining.toLocaleString()}</span>
+                              <span className="text-[10px] font-mono text-outline">of {q.extra_allocated.toLocaleString()}</span>
+                            </div>
+                          ) : <span className="text-xs text-outline-variant">None</span>}
+                        </td>
+                        <td className="px-4 py-4 text-right">
+                          <span className="text-sm font-mono font-semibold text-on-surface">{q ? q.total_available.toLocaleString() : "—"}</span>
+                        </td>
+                        {isLeader && (
+                          <td className="px-4 py-4 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              {allocatingMember === m.supabase_auth_id ? (
+                                <div className="flex items-center gap-1">
+                                  <input
+                                    type="number"
+                                    value={allocateInput}
+                                    onChange={(e) => setAllocateInput(e.target.value)}
+                                    placeholder="0"
+                                    className="w-16 bg-surface-container-low/50 border border-outline-variant/20 rounded px-2 py-1 text-xs font-mono text-on-surface focus:outline-none focus:border-primary"
+                                    min={1}
+                                  />
+                                  <button
+                                    onClick={async () => {
+                                      const amount = parseInt(allocateInput, 10);
+                                      if (!amount || amount <= 0) { setAllocatingMember(null); return; }
+                                      const { data: sesh } = await supabase.auth.getSession();
+                                      const tok = sesh.session?.access_token;
+                                      if (!tok) return;
+                                      const res = await fetch(`/api/org/members/${m.supabase_auth_id}/extra-tokens`, {
+                                        method: "POST",
+                                        headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
+                                        body: JSON.stringify({ amount }),
+                                      });
+                                      if (res.ok) {
+                                        await refreshQuotas(tok);
+                                      } else {
+                                        const errData = await res.json().catch(() => ({}));
+                                        setError(errData.detail || "Failed to allocate.");
+                                      }
+                                      setAllocatingMember(null);
+                                      setAllocateInput("");
+                                    }}
+                                    className="p-1 rounded bg-primary/10 text-primary hover:bg-primary/20 transition-colors"
+                                    title="Confirm"
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  onClick={() => { setAllocatingMember(m.supabase_auth_id); setAllocateInput(""); }}
+                                  className="text-[10px] font-mono text-primary border border-primary/30 px-2.5 py-1 rounded hover:bg-primary/10 transition-colors"
+                                >
+                                  Allocate
+                                </button>
+                              )}
+                              {m.role !== "leader" && (
+                                <button
+                                  onClick={() => handleRemoveMember(m.id)}
+                                  className="text-outline-variant hover:text-error transition-colors p-1.5 rounded hover:bg-error/10"
+                                  title="Remove member"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          </td>
                         )}
-                        {m.role !== "leader" && (
-                          <button
-                            onClick={() => handleRemoveMember(m.id)}
-                            className="text-outline-variant hover:text-error transition-colors p-1 rounded hover:bg-error/10"
-                            title="Remove member"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {!isLeader && roleBadge(m.role)}
-                  </div>
-                </div>
-              ))}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {/* Pagination */}
+          {memberTotal > 25 && (
+            <div className="px-6 py-3 border-t border-outline-variant/20 flex items-center justify-between">
+              <span className="text-xs font-mono text-outline">Page {memberPage + 1} of {Math.ceil(memberTotal / 25)}</span>
+              <div className="flex items-center gap-2">
+                <button disabled={memberPage === 0} onClick={() => setMemberPage(memberPage - 1)}
+                  className="px-3 py-1 text-xs rounded border border-outline-variant/20 disabled:opacity-30 hover:border-primary/40 transition-colors">Prev</button>
+                <button disabled={memberPage >= Math.ceil(memberTotal / 25) - 1} onClick={() => setMemberPage(memberPage + 1)}
+                  className="px-3 py-1 text-xs rounded border border-outline-variant/20 disabled:opacity-30 hover:border-primary/40 transition-colors">Next</button>
+              </div>
             </div>
           )}
         </div>

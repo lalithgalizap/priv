@@ -155,10 +155,12 @@ def _resolve_is_platform_admin(user_id: str) -> bool:
 
 
 def _resolve_tenant_from_db(user_id: str) -> str | None:
-    """Look up tenant_id from user profile. Returns None if no profile."""
+    """Look up tenant_id from user profile. Returns None if no profile or no tenant."""
     try:
         profile = db.ensure_user_profile(user_id, "")
-        return str(profile["tenant_id"]) if profile else None
+        if not profile or not profile.get("tenant_id"):
+            return None
+        return str(profile["tenant_id"])
     except Exception:
         return None
 

@@ -5,11 +5,7 @@ const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 export async function GET(request: NextRequest) {
   try {
     const authHeader = request.headers.get("authorization");
-    const { searchParams } = new URL(request.url);
-    // Forward all query params to backend
-    const queryString = searchParams.toString();
-    const url = `${BACKEND_URL}/api/v1/admin/companies${queryString ? `?${queryString}` : ""}`;
-    const res = await fetch(url, {
+    const res = await fetch(`${BACKEND_URL}/api/v1/me/preferences`, {
       headers: authHeader ? { Authorization: authHeader } : {},
     });
     if (!res.ok) {
@@ -22,12 +18,12 @@ export async function GET(request: NextRequest) {
   }
 }
 
-export async function POST(request: NextRequest) {
+export async function PATCH(request: NextRequest) {
   try {
     const authHeader = request.headers.get("authorization");
     const body = await request.json();
-    const res = await fetch(`${BACKEND_URL}/api/v1/admin/companies`, {
-      method: "POST",
+    const res = await fetch(`${BACKEND_URL}/api/v1/me/preferences`, {
+      method: "PATCH",
       headers: {
         "Content-Type": "application/json",
         ...(authHeader ? { Authorization: authHeader } : {}),

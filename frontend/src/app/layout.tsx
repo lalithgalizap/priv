@@ -1,22 +1,28 @@
 import type { Metadata } from "next";
-import { Hanken_Grotesk, JetBrains_Mono } from "next/font/google";
+import { Sora, JetBrains_Mono, Inter } from "next/font/google";
 import "./globals.css";
 
-const hanken = Hanken_Grotesk({
-  variable: "--font-hanken",
+const sora = Sora({
+  variable: "--font-sora",
   subsets: ["latin"],
-  weight: ["400", "600", "700"],
+  weight: ["400", "600", "700", "800"],
+});
+
+const inter = Inter({
+  variable: "--font-inter",
+  subsets: ["latin"],
+  weight: ["400", "500"],
 });
 
 const jetbrains = JetBrains_Mono({
   variable: "--font-jetbrains",
   subsets: ["latin"],
-  weight: ["400", "600"],
+  weight: ["400", "500"],
 });
 
 export const metadata: Metadata = {
-  title: "Anonymizer Core",
-  description: "Enterprise AI mediation with zero-knowledge anonymity.",
+  title: "Quintal AI",
+  description: "Enterprise AI Platform",
 };
 
 export default function RootLayout({
@@ -30,7 +36,7 @@ export default function RootLayout({
       className="dark"
       data-scroll-behavior="smooth"
     >
-      <body className={`${hanken.variable} ${jetbrains.variable} min-h-screen bg-background text-on-surface font-sans antialiased`}>
+      <body className={`${sora.variable} ${inter.variable} ${jetbrains.variable} min-h-screen bg-background text-on-surface font-body antialiased`}>
         {children}
       </body>
     </html>

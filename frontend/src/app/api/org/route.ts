@@ -5,7 +5,10 @@ const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 export async function GET(request: NextRequest) {
   try {
     const authHeader = request.headers.get("authorization");
-    const res = await fetch(`${BACKEND_URL}/api/v1/org/members`, {
+    const { searchParams } = new URL(request.url);
+    const queryString = searchParams.toString();
+    const url = `${BACKEND_URL}/api/v1/org/members${queryString ? `?${queryString}` : ""}`;
+    const res = await fetch(url, {
       headers: authHeader ? { Authorization: authHeader } : {},
     });
     if (!res.ok) {

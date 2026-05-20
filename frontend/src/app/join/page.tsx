@@ -11,7 +11,6 @@ import {
   Building2,
   Users,
   ArrowRight,
-  LogIn,
   UserPlus,
   Crown,
 } from "lucide-react";
@@ -65,7 +64,6 @@ function JoinContent() {
       try {
         const res = await fetch(`/api/invite/validate?token=${encodeURIComponent(effectiveToken)}`);
         if (!res.ok) {
-          const err = await res.json();
           // Stale token in localStorage after DB wipe — clear it and redirect
           localStorage.removeItem("pending_invite_token");
           router.push("/console");
@@ -73,6 +71,23 @@ function JoinContent() {
         } else {
           const data = await res.json();
           setInvite(data);
+
+          // Auto-accept if user is already logged in
+          if (loggedIn && sesh.session?.access_token) {
+            setAccepting(true);
+            const acceptRes = await fetch("/api/invite/accept", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${sesh.session.access_token}` },
+              body: JSON.stringify({ token: effectiveToken }),
+            });
+            if (acceptRes.ok) {
+              setAccepted(true);
+              localStorage.removeItem("pending_invite_token");
+              setTimeout(() => router.push("/console"), 1500);
+            } else {
+              setAccepting(false);
+            }
+          }
         }
       } catch {
         setError("Network error. Please try again.");
@@ -187,44 +202,24 @@ function JoinContent() {
         </div>
 
         {isLoggedIn ? (
-          <div className="space-y-3">
-            <p className="text-xs text-center text-outline font-mono">
-              Signed in as <span className="text-on-surface">{userEmail}</span>
+          <div className="space-y-3 text-center">
+            <Loader2 className="w-6 h-6 animate-spin mx-auto text-primary" />
+            <p className="text-xs text-outline font-mono">
+              Accepting invite as <span className="text-on-surface">{userEmail}</span>...
             </p>
-            <button
-              onClick={handleAccept}
-              disabled={accepting}
-              className="w-full py-3 rounded-lg text-xs font-mono bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 disabled:opacity-40 transition-all flex items-center justify-center gap-2"
-            >
-              {accepting ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <CheckCircle2 className="w-4 h-4" />
-              )}
-              Accept Invite
-            </button>
           </div>
         ) : (
           <div className="space-y-3">
             <p className="text-xs text-center text-outline font-mono">
-              Sign up or log in to accept this invite.
+              Create an account to join this organization.
             </p>
-            <div className="flex gap-3">
-              <Link
-                href="/signup"
-                className="flex-1 py-3 rounded-lg text-xs font-mono bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-all flex items-center justify-center gap-2"
-              >
-                <UserPlus className="w-4 h-4" />
-                Sign Up
-              </Link>
-              <Link
-                href="/login"
-                className="flex-1 py-3 rounded-lg text-xs font-mono bg-surface-container-high/50 text-on-surface border border-outline-variant/20 hover:bg-surface-container-high transition-all flex items-center justify-center gap-2"
-              >
-                <LogIn className="w-4 h-4" />
-                Log In
-              </Link>
-            </div>
+            <Link
+              href="/signup"
+              className="w-full py-3 rounded-lg text-xs font-mono bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-all flex items-center justify-center gap-2"
+            >
+              <UserPlus className="w-4 h-4" />
+              Sign Up
+            </Link>
           </div>
         )}
       </div>
