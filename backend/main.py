@@ -20,6 +20,7 @@ load_dotenv()
 
 from middleware.auth import get_current_user, UserSession, require_leader, require_member, require_superadmin
 import db
+import transport
 
 # Production logging
 logging.basicConfig(
@@ -411,8 +412,8 @@ async def _run_ai_mediation(
     )
 
     return MediationResponse(
-        prompt_preview=prompt[:100],
-        ai_response=ai_response,
+        prompt_preview=transport.encode_payload(prompt[:100]),
+        ai_response=transport.encode_payload(ai_response),
         tokens_processed=tot_tokens,
         model=model,
         duration_ms=duration,
@@ -427,13 +428,16 @@ async def execute_anonymous_brokerage(
     current_user: UserSession = Depends(get_current_user),
 ):
     """Text-only mediation endpoint."""
-    history = [msg.model_dump() for msg in payload.history]
+    # Decode transport-encoded fields
+    decoded_prompt = transport.decode_payload(payload.prompt)
+    decoded_system = transport.decode_payload(payload.system_prompt) if payload.system_prompt else None
+    history = [{"role": msg.role, "content": transport.decode_payload(msg.content)} for msg in payload.history]
     return await _run_ai_mediation(
-        payload.prompt,
+        decoded_prompt,
         payload.model,
         current_user,
         history=history,
-        system_prompt=payload.system_prompt,
+        system_prompt=decoded_system,
         max_tokens=payload.max_tokens,
     )
 
@@ -451,7 +455,10 @@ async def execute_upload_brokerage(
     current_user: UserSession = Depends(get_current_user),
 ):
     """Mediation with optional document upload (PDF, DOCX, TXT, MD)."""
-    full_prompt = prompt
+    # Decode transport-encoded fields
+    decoded_prompt = transport.decode_payload(prompt)
+    decoded_system = transport.decode_payload(system_prompt) if system_prompt else None
+    full_prompt = decoded_prompt
     if file and file.filename:
         try:
             content = await asyncio.get_event_loop().run_in_executor(None, file.file.read)
@@ -466,11 +473,13 @@ async def execute_upload_brokerage(
             None, _parse_file_bytes, content, file.filename
         )
         if doc_text:
-            full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{prompt}"
+            full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{decoded_prompt}"
             logger.info("Document uploaded: %s (%d chars)", file.filename, len(doc_text))
 
     try:
         history_list = json.loads(history)
+        # Decode transport-encoded history content
+        history_list = [{"role": m.get("role", "user"), "content": transport.decode_payload(m.get("content", ""))} for m in history_list if isinstance(m, dict)]
     except json.JSONDecodeError:
         history_list = []
 
@@ -479,7 +488,7 @@ async def execute_upload_brokerage(
         model,
         current_user,
         history=history_list,
-        system_prompt=system_prompt,
+        system_prompt=decoded_system,
         max_tokens=max_tokens,
     )
 

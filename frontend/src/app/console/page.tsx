@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Send, User, Bot, Loader2, Paperclip, X, Plus, Trash2, MessageSquare, PanelLeftClose, PanelLeft, AlertTriangle } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { supabase } from "@/lib/supabase";
+import { encodePayload, decodePayload } from "@/lib/transport";
 import AppShell from "@/components/AppShell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -408,10 +409,10 @@ export default function ConsolePage() {
 
       if (selectedFile) {
         const formData = new FormData();
-        formData.append("prompt", trimmed);
+        formData.append("prompt", encodePayload(trimmed));
         formData.append("model", selectedModel);
-        formData.append("history", JSON.stringify(history));
-        if (systemPrompt) formData.append("system_prompt", systemPrompt);
+        formData.append("history", JSON.stringify(history.map((m) => ({ role: m.role, content: encodePayload(m.content) }))));
+        if (systemPrompt) formData.append("system_prompt", encodePayload(systemPrompt));
         formData.append("max_tokens", String(maxTokens));
         formData.append("file", selectedFile);
 
@@ -426,12 +427,12 @@ export default function ConsolePage() {
         if (fileInputRef.current) fileInputRef.current.value = "";
       } else {
         const body: Record<string, unknown> = {
-          prompt: trimmed,
+          prompt: encodePayload(trimmed),
           model: selectedModel,
-          history,
+          history: history.map((m) => ({ role: m.role, content: encodePayload(m.content) })),
           max_tokens: maxTokens,
         };
-        if (systemPrompt) body.system_prompt = systemPrompt;
+        if (systemPrompt) body.system_prompt = encodePayload(systemPrompt);
 
         res = await fetch("/api/mediate", {
           method: "POST",
@@ -458,7 +459,7 @@ export default function ConsolePage() {
 
       const assistantMsg: ChatMessage = {
         role: "assistant",
-        content: data.ai_response || "No response received.",
+        content: decodePayload(data.ai_response) || "No response received.",
         timestamp: new Date().toISOString(),
       };
 
