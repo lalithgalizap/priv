@@ -112,8 +112,10 @@ async function runEnvelope<TParams>(
 }
 
 /**
- * Build the POST entry-point for a route. Reads `X-Wire-Method` to dispatch
- * to the right logical handler. All encrypted calls hit this single POST.
+ * Build the POST entry-point for a route. Reads the logical method from the
+ * ``X-Wire-Method`` header first, falling back to the ``_wm`` query parameter
+ * (some intermediaries — CloudFront in particular — strip non-allowlisted
+ * custom headers, so the query parameter is always forwarded as a backup).
  */
 export function dispatchEnvelope<TParams = unknown>(
   handlers: Partial<Record<WireMethod, Handler<TParams>>>
@@ -122,7 +124,14 @@ export function dispatchEnvelope<TParams = unknown>(
     request: NextRequest,
     routeArg?: { params: Promise<TParams> } | TParams
   ): Promise<Response> {
-    const wireMethod = ((request.headers.get("x-wire-method") || "POST")
+    const headerMethod = request.headers.get("x-wire-method");
+    let queryMethod: string | null = null;
+    try {
+      queryMethod = new URL(request.url).searchParams.get("_wm");
+    } catch {
+      queryMethod = null;
+    }
+    const wireMethod = ((headerMethod || queryMethod || "POST")
       .toUpperCase() as WireMethod);
     const handler = handlers[wireMethod];
     if (!handler) {

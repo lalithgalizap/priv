@@ -96,10 +96,16 @@ export async function apiFetch<T = unknown>(
 
   headers["Content-Type"] = "application/json";
   headers["X-Wire-Version"] = "1";
+  // Logical method travels via the X-Wire-Method header AND a query parameter.
+  // CloudFront / proxies often strip non-allowlisted custom headers; the query
+  // parameter is always forwarded as part of the path so the route handler can
+  // dispatch correctly even when the header is missing.
   headers["X-Wire-Method"] = logicalMethod;
+  const sep = path.includes("?") ? "&" : "?";
+  const wirePath = `${path}${sep}_wm=${encodeURIComponent(logicalMethod)}`;
 
   // Wire method is always POST to allow a request body in every case.
-  const res = await fetch(path, {
+  const res = await fetch(wirePath, {
     method: "POST",
     headers,
     body: JSON.stringify(envelope),
