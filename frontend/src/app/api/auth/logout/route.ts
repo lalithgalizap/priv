@@ -17,7 +17,8 @@ export async function POST(request: NextRequest) {
   });
   if (envelope && envelope.epk && envelope.n && envelope.c) {
     try {
-      const opened = openRequest(envelope);
+      const url = new URL(request.url);
+      const opened = openRequest(envelope, url.pathname);
       seal = opened.seal;
     } catch {
       // ignore — still clear cookies

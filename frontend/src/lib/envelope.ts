@@ -4,8 +4,12 @@
  *
  * Wire protocol:
  *   - All encrypted requests use HTTP POST (because GET cannot carry a body).
- *   - The original logical method is sent in the `X-Wire-Method` header
- *     ("GET" | "POST" | "PATCH" | "DELETE").
+ *   - The original logical method is sent in the ``X-Wire-Method`` header
+ *     (preferred) and as the ``_wm`` query parameter (fallback for proxies
+ *     that strip custom headers, e.g. CloudFront's default origin policy).
+ *   - The plaintext is sealed with AES-GCM whose AAD is the URL path, so an
+ *     envelope captured at one route cannot be replayed at another.
+ *   - Plaintext carries a ``ts`` field; openRequest enforces a replay window.
  *   - Routes register a map of handlers keyed by logical method.
  *
  * Usage:
@@ -57,9 +61,6 @@ async function runEnvelope<TParams>(
     envelope = null;
   }
 
-  let body: unknown = null;
-  let seal: (data: unknown) => { n: string; c: string };
-
   if (!envelope || !envelope.epk || !envelope.n || !envelope.c) {
     return NextResponse.json(
       { error: "Encrypted envelope required." },
@@ -67,8 +68,12 @@ async function runEnvelope<TParams>(
     );
   }
 
+  let body: unknown = null;
+  let seal: (data: unknown) => { n: string; c: string };
+
   try {
-    const opened = openRequest(envelope);
+    const url = new URL(request.url);
+    const opened = openRequest(envelope, url.pathname);
     body = opened.body;
     seal = opened.seal;
   } catch (err) {
@@ -113,9 +118,8 @@ async function runEnvelope<TParams>(
 
 /**
  * Build the POST entry-point for a route. Reads the logical method from the
- * ``X-Wire-Method`` header first, falling back to the ``_wm`` query parameter
- * (some intermediaries — CloudFront in particular — strip non-allowlisted
- * custom headers, so the query parameter is always forwarded as a backup).
+ * ``X-Wire-Method`` header first, falling back to the ``_wm`` query
+ * parameter for proxies that strip non-allowlisted custom headers.
  */
 export function dispatchEnvelope<TParams = unknown>(
   handlers: Partial<Record<WireMethod, Handler<TParams>>>
@@ -145,9 +149,7 @@ export function dispatchEnvelope<TParams = unknown>(
 }
 
 /**
- * Single-handler convenience: equivalent to dispatchEnvelope with one entry
- * accepting any method. Used for routes that don't care which logical verb
- * was sent.
+ * Single-handler convenience: wrap any-method handler.
  */
 export function withEnvelope<TParams = unknown>(handler: Handler<TParams>) {
   return async function POST(

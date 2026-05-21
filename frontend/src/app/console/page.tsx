@@ -6,8 +6,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { authedFetch } from "@/lib/auth";
 import { toast } from "@/lib/toast";
 import AppShell from "@/components/AppShell";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import LazyMarkdown from "@/components/LazyMarkdown";
 
 // Pricing (credits per 1k tokens) — superadmin can update via /api/admin/pricing.
 // Used for client-side cost estimation so we don't ping the backend on every keystroke.
@@ -598,9 +597,7 @@ export default function ConsolePage() {
                   >
                     {msg.role === "assistant" ? (
                       <div className="prose prose-sm max-w-none prose-p:text-on-surface prose-li:text-on-surface prose-strong:text-on-surface prose-headings:text-on-surface prose-code:text-primary prose-a:text-primary [&_*]:text-on-surface">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {msg.content}
-                        </ReactMarkdown>
+                        <LazyMarkdown>{msg.content}</LazyMarkdown>
                       </div>
                     ) : (
                       <span className="whitespace-pre-wrap">{msg.content}</span>

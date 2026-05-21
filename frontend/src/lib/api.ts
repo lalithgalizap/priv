@@ -2,13 +2,14 @@
  * Browser-side encrypted API client.
  *
  * Every encrypted call travels over an HTTP POST to a same-origin /api/**
- * route. The original logical verb (GET / PATCH / DELETE / POST) is sent in
- * the `X-Wire-Method` header so the route handler can dispatch internally.
- * This sidesteps the browser-side restriction that GET requests cannot carry
- * a body, while keeping a single uniform wire protocol.
+ * route. The original logical verb (GET/POST/PATCH/DELETE) is sent in the
+ * ``X-Wire-Method`` header (preferred) and the ``_wm`` query parameter
+ * (fallback for proxies that strip custom headers, e.g. CloudFront's
+ * default origin request policy).
  *
  * Body and response are sealed in an ECDH+AES-GCM envelope so DevTools shows
- * ciphertext only.
+ * ciphertext only. The route's path is bound into AES-GCM AAD; the plaintext
+ * carries a millisecond timestamp; the server enforces a ±60s replay window.
  */
 
 import { sealRequest, openResponse, type ResponseEnvelope } from "@/lib/crypto";
@@ -72,11 +73,15 @@ async function normalizeFormData(fd: FormData): Promise<NormalizedBody> {
   return { body: out };
 }
 
+function pathnameOnly(path: string): string {
+  const idx = path.indexOf("?");
+  return (idx >= 0 ? path.slice(0, idx) : path) || "/";
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   opts: ApiFetchOptions = {}
 ): Promise<T> {
-  // Logical method as the caller intended.
   const logicalMethod = (
     opts.method ||
     (opts.body !== undefined || opts.formData ? "POST" : "GET")
@@ -92,19 +97,15 @@ export async function apiFetch<T = unknown>(
   }
 
   const serverPub = await getServerPub();
-  const { envelope, aesKey } = await sealRequest(serverPub, plaintext ?? {});
+  const aadPath = pathnameOnly(path);
+  const { envelope, aesKey, aad } = await sealRequest(serverPub, aadPath, plaintext ?? {});
 
   headers["Content-Type"] = "application/json";
   headers["X-Wire-Version"] = "1";
-  // Logical method travels via the X-Wire-Method header AND a query parameter.
-  // CloudFront / proxies often strip non-allowlisted custom headers; the query
-  // parameter is always forwarded as part of the path so the route handler can
-  // dispatch correctly even when the header is missing.
   headers["X-Wire-Method"] = logicalMethod;
   const sep = path.includes("?") ? "&" : "?";
   const wirePath = `${path}${sep}_wm=${encodeURIComponent(logicalMethod)}`;
 
-  // Wire method is always POST to allow a request body in every case.
   const res = await fetch(wirePath, {
     method: "POST",
     headers,
@@ -129,7 +130,7 @@ export async function apiFetch<T = unknown>(
   let payload: unknown;
   if (isEnv) {
     try {
-      payload = await openResponse(respJson as ResponseEnvelope, aesKey);
+      payload = await openResponse(respJson as ResponseEnvelope, aesKey, aad);
     } catch (e) {
       throw new Error(`Failed to decrypt response: ${(e as Error).message}`);
     }

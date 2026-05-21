@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from threading import RLock
 from typing import Any, Callable
 
@@ -18,15 +19,23 @@ from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
+# Configure structured JSON logging *before* importing app modules so every
+# logger created from this point on inherits the JSON formatter and the
+# request-context binders.
+from logging_config import (
+    configure_logging,
+    new_request_id,
+    request_id_var,
+    user_id_var,
+    tenant_id_var,
+    hash_id,
+)
+configure_logging()
+
 from middleware.auth import get_current_user, UserSession, require_leader, require_member, require_superadmin
 import db
+from async_io import run_db, run_file, shutdown_async_io
 
-# Production logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("anonymizer")
 
 
@@ -113,9 +122,38 @@ def _cached_global_usage() -> dict:
 try:
     db.init_db()
     db.ensure_default_tenant()
+    db.init_audit_log_table()
     logger.info("PostgreSQL initialized successfully")
 except Exception as e:
-    logger.error("PostgreSQL initialization failed: %s", e)
+    logger.error("PostgreSQL initialization failed", extra={"error": str(e)})
+
+
+# ── Lifespan: graceful shutdown drains in-flight requests ────────
+
+
+_inflight_count = 0
+_inflight_done = asyncio.Event()
+_inflight_done.set()  # No work in flight at startup.
+_shutting_down = False
+GRACEFUL_SHUTDOWN_SECONDS = int(os.getenv("GRACEFUL_SHUTDOWN_SECONDS", "30"))
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """FastAPI lifespan: clean async-io resources, drain on shutdown."""
+    yield
+    global _shutting_down
+    _shutting_down = True
+    logger.info("Shutdown initiated; draining in-flight requests",
+                extra={"inflight": _inflight_count, "timeout_s": GRACEFUL_SHUTDOWN_SECONDS})
+    try:
+        await asyncio.wait_for(_inflight_done.wait(), timeout=GRACEFUL_SHUTDOWN_SECONDS)
+        logger.info("All in-flight requests drained")
+    except asyncio.TimeoutError:
+        logger.warning("Graceful shutdown timeout; %d requests still in flight",
+                       _inflight_count)
+    await shutdown_async_io()
+
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -123,9 +161,117 @@ app = FastAPI(
     title="Anonymizer Core - Mediation Server",
     description="Enterprise AI mediation with zero-knowledge anonymity.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# ── Request middleware: request_id, log context, in-flight tracking ──
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    """Bind a request_id (from header or new), track in-flight count, and
+    refuse new traffic during graceful shutdown."""
+    global _inflight_count
+
+    # Reject early during shutdown so the load balancer can drain us.
+    if _shutting_down and request.url.path != "/health":
+        return _shutdown_response()
+
+    incoming_rid = request.headers.get("x-request-id") or request.headers.get("x-amz-cf-id")
+    rid = incoming_rid if (incoming_rid and len(incoming_rid) <= 96) else new_request_id()
+    rid_token = request_id_var.set(rid)
+    user_token = user_id_var.set("")
+    tenant_token = tenant_id_var.set("")
+
+    _inflight_count += 1
+    _inflight_done.clear()
+    started = time.monotonic()
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "request",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": elapsed_ms,
+            },
+        )
+        return response
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.exception(
+            "request crashed",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": elapsed_ms,
+                "error_type": type(exc).__name__,
+            },
+        )
+        raise
+    finally:
+        _inflight_count -= 1
+        if _inflight_count <= 0:
+            _inflight_count = 0
+            _inflight_done.set()
+        request_id_var.reset(rid_token)
+        user_id_var.reset(user_token)
+        tenant_id_var.reset(tenant_token)
+
+
+def _shutdown_response():
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        {"error": "Server is shutting down."},
+        status_code=503,
+        headers={"Connection": "close", "Retry-After": "5"},
+    )
+
+
+def _client_ip(request: Request) -> str:
+    """Extract the actual client IP, trusting only the immediate proxy chain."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+async def _audit(
+    request: Request,
+    actor: UserSession,
+    action: str,
+    *,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    before: dict | None = None,
+    after: dict | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Record an audit log row off the event loop. Non-blocking, never raises."""
+    try:
+        await run_db(
+            db.write_audit_log,
+            actor_user_id=actor.user_id,
+            actor_email=actor.email,
+            actor_role=("superadmin" if actor.is_platform_admin else actor.role),
+            actor_ip=_client_ip(request),
+            request_id=request_id_var.get() or None,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            before=before,
+            after=after,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        # _audit must never break the request; structured-log the failure.
+        logger.warning("audit_failed", extra={"action": action, "error": str(exc)})
 
 # CORS: restrict to known origins only
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
@@ -133,8 +279,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-Id"],
+    expose_headers=["X-Request-Id"],
 )
 
 # AWS Bedrock configuration
@@ -225,13 +372,13 @@ async def health_check(request: Request):
 
     clock_drift_ms: int | None = None
     try:
-        # Cheap HEAD request to a global public endpoint. The Date header is
-        # populated by the server's NTP-synced clock.
-        import urllib.request
-        req = urllib.request.Request("https://www.google.com", method="HEAD")
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            from email.utils import parsedate_to_datetime
-            server_time = parsedate_to_datetime(resp.headers.get("Date", "")).timestamp()
+        from async_io import get_http_client
+        from email.utils import parsedate_to_datetime
+
+        resp = await get_http_client().head("https://www.google.com", timeout=2.0)
+        date_header = resp.headers.get("Date", "")
+        if date_header:
+            server_time = parsedate_to_datetime(date_header).timestamp()
             clock_drift_ms = int((time.time() - server_time) * 1000)
     except Exception:
         clock_drift_ms = None
@@ -243,6 +390,8 @@ async def health_check(request: Request):
         "ai_provider": "configured" if HAS_AWS_BEDROCK else ("mock" if ENABLE_MOCK_MODE else "missing"),
         "environment": ENVIRONMENT,
         "clock_drift_ms": clock_drift_ms,
+        "shutting_down": _shutting_down,
+        "inflight_requests": _inflight_count,
         "version": "1.0.0",
     }
 
@@ -292,7 +441,14 @@ async def _run_ai_mediation(
     system_prompt: str | None = None,
     max_tokens: int = 1024,
 ) -> MediationResponse:
-    """Core mediation logic shared by JSON and multipart endpoints."""
+    """Core mediation logic shared by JSON and multipart endpoints.
+
+    Concurrency: every blocking step (DB calls, Bedrock invocation) runs in a
+    bounded threadpool via run_db / run_in_executor so the event loop never
+    blocks. The DB connection used for credit reservation is released *before*
+    the Bedrock call; settle and telemetry use fresh connections so a slow
+    upstream cannot starve the pool.
+    """
     start_time = time.time()
 
     has_aws = HAS_AWS_BEDROCK
@@ -302,7 +458,6 @@ async def _run_ai_mediation(
     out_tokens = 0
     tot_tokens = 0
 
-    # Build message history
     default_system = (
         "You must respond in English only. Be concise and helpful. "
         "Use Markdown formatting for structure: headings, bullet lists, numbered lists, "
@@ -345,14 +500,15 @@ async def _run_ai_mediation(
             "messages": messages,
         }
 
-        # ── Atomic credit reservation ──
+        # ── Atomic credit reservation (DB connection held only for this call) ──
         estimated_input = len(prompt) // 4 + 1
         estimated_credits = db.estimate_request_credits(
             model_id,
             estimated_input_tokens=estimated_input,
             estimated_output_tokens=max_tokens,
         )
-        reservation = db.reserve_credits(
+        reservation = await run_db(
+            db.reserve_credits,
             current_user.user_id,
             current_user.tenant_id,
             estimated_credits,
@@ -365,10 +521,8 @@ async def _run_ai_mediation(
             )
 
         try:
-            # boto3 is synchronous; running it directly in an async handler
-            # blocks the event loop and serialises every concurrent user.
-            # Offload to FastAPI's threadpool so the loop stays free.
-            # Adaptive retries are configured on the client itself.
+            # boto3 is synchronous. Offload to the default executor; adaptive
+            # retries are configured on the client itself.
             def _invoke():
                 return client.invoke_model(
                     modelId=model_id,
@@ -381,7 +535,6 @@ async def _run_ai_mediation(
             raw = response["body"].read()
             response_body = json.loads(raw.decode("utf-8"))
 
-            # Robust response parsing
             ai_response = ""
             if isinstance(response_body.get("choices"), list) and response_body["choices"]:
                 ai_response = response_body["choices"][0].get("message", {}).get("content", "")
@@ -397,28 +550,30 @@ async def _run_ai_mediation(
                 ai_response = response_body["generations"][0].get("text", "")
 
             if not ai_response:
-                logger.warning("Empty AI response. Raw: %s", json.dumps(response_body)[:500])
+                logger.warning("Empty AI response", extra={"raw_preview": json.dumps(response_body)[:500]})
 
             usage = response_body.get("usage", {})
             in_tokens = usage.get("input_tokens", usage.get("prompt_tokens", len(prompt.split())))
             out_tokens = usage.get("output_tokens", usage.get("completion_tokens", 128))
             tot_tokens = usage.get("total_tokens", in_tokens + out_tokens)
         except ClientError as e:
-            db.release_reserved_credits(
+            await run_db(
+                db.release_reserved_credits,
                 current_user.user_id,
                 reservation["reserved_credits"],
             )
-            logger.error("AWS Bedrock error: %s", e)
+            logger.error("AWS Bedrock error", extra={"error": str(e)})
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Upstream AI provider error.",
             )
         except Exception as e:
-            db.release_reserved_credits(
+            await run_db(
+                db.release_reserved_credits,
                 current_user.user_id,
                 reservation["reserved_credits"],
             )
-            logger.exception("Mediation crashed: %s", e)
+            logger.exception("Mediation crashed", extra={"error_type": type(e).__name__})
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Mediation failed.",
@@ -426,25 +581,29 @@ async def _run_ai_mediation(
 
     duration = int((time.time() - start_time) * 1000)
 
-    # Finalize credit consumption
+    # Finalize credit consumption (fresh DB connections, off the event loop).
     actual_credits = db.calculate_request_credits(model or AWS_BEDROCK_MODEL, in_tokens, out_tokens)
     if has_aws and not current_user.is_platform_admin:
-        db.settle_credits(
+        await run_db(
+            db.settle_credits,
             current_user.user_id,
             current_user.tenant_id,
             reserved=reservation["reserved_credits"],
             actual=actual_credits,
         )
     elif not has_aws and not current_user.is_platform_admin:
-        # Dev-only mock-mode consumption. Catch only the expected ValueError;
-        # anything else should surface so we can fix it.
         try:
-            db.consume_user_credits(current_user.user_id, current_user.tenant_id, actual_credits)
+            await run_db(
+                db.consume_user_credits,
+                current_user.user_id,
+                current_user.tenant_id,
+                actual_credits,
+            )
         except ValueError as ve:
-            logger.info("Mock-mode quota exhausted for user=%s: %s", current_user.user_id, ve)
+            logger.info("Mock-mode quota exhausted", extra={"error": str(ve)})
 
-    # Log telemetry
-    db.save_usage_metric(
+    await run_db(
+        db.save_usage_metric,
         tenant_id=current_user.tenant_id,
         supabase_auth_id=current_user.user_id,
         model_identifier=model,
@@ -456,12 +615,13 @@ async def _run_ai_mediation(
     )
 
     logger.info(
-        "Mediation: tenant=%s model=%s tokens=%d credits=%d duration=%dms",
-        current_user.tenant_id,
-        model,
-        tot_tokens,
-        actual_credits,
-        duration,
+        "Mediation completed",
+        extra={
+            "model": model,
+            "tokens": tot_tokens,
+            "credits": actual_credits,
+            "duration_ms": duration,
+        },
     )
 
     return MediationResponse(
@@ -504,24 +664,29 @@ async def execute_upload_brokerage(
     file: UploadFile = File(None),
     current_user: UserSession = Depends(get_current_user),
 ):
-    """Mediation with optional document upload (PDF, DOCX, TXT, MD)."""
+    """Mediation with optional document upload (PDF, DOCX, TXT, MD).
+
+    File reads and parsing run under the bounded ``run_file`` semaphore so a
+    burst of uploads cannot exhaust the worker memory budget.
+    """
     full_prompt = prompt
     if file and file.filename:
         try:
-            content = await asyncio.get_event_loop().run_in_executor(None, file.file.read)
+            content = await run_file(file.file.read)
         except Exception as e:
-            logger.warning("Could not read uploaded file: %s", e)
+            logger.warning("Could not read uploaded file", extra={"error": str(e)})
             raise HTTPException(status_code=400, detail="Failed to read uploaded file.")
 
         if len(content) > MAX_FILE_SIZE_BYTES:
             raise HTTPException(status_code=413, detail="File too large. Max 5MB.")
 
-        doc_text = await asyncio.get_event_loop().run_in_executor(
-            None, _parse_file_bytes, content, file.filename
-        )
+        doc_text = await run_file(_parse_file_bytes, content, file.filename)
         if doc_text:
             full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{prompt}"
-            logger.info("Document uploaded: %s (%d chars)", file.filename, len(doc_text))
+            logger.info(
+                "Document uploaded",
+                extra={"filename": file.filename, "char_count": len(doc_text)},
+            )
 
     try:
         history_list = json.loads(history)
@@ -907,11 +1072,24 @@ async def leader_allocate_member_extra(
     current_user: UserSession = Depends(require_leader),
 ):
     """Leader allocates extra credits from org pool to a member."""
-    profile = db.ensure_user_profile(supabase_auth_id, "")
+    profile = await run_db(db.ensure_user_profile, supabase_auth_id, "")
     if not profile or str(profile["tenant_id"]) != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Can only modify members in your organization.")
     try:
-        result = db.allocate_member_extra_credits(current_user.tenant_id, supabase_auth_id, payload.amount)
+        result = await run_db(
+            db.allocate_member_extra_credits,
+            current_user.tenant_id,
+            supabase_auth_id,
+            payload.amount,
+        )
+        await _audit(
+            request,
+            current_user,
+            "org.member.allocate_extra_credits",
+            target_type="user_profile",
+            target_id=supabase_auth_id,
+            metadata={"amount": payload.amount},
+        )
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -929,11 +1107,20 @@ async def leader_topup_org(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid card number")
     if set(card_number) != {"0"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Test mode only accepts 0000 0000 0000 0000")
-    result = db.add_org_extra_credits(
+    result = await run_db(
+        db.add_org_extra_credits,
         current_user.tenant_id,
         payload.amount,
         current_user.user_id,
         payload.note or "Leader top-up",
+    )
+    await _audit(
+        request,
+        current_user,
+        "org.topup",
+        target_type="tenant",
+        target_id=current_user.tenant_id,
+        metadata={"amount": payload.amount, "note": payload.note or "Leader top-up"},
     )
     return {"status": "success", "extra_token_pool": result["extra_token_pool"], "note": payload.note or "Leader top-up"}
 
@@ -984,7 +1171,8 @@ async def invite_member(
 ):
     """Invite a user to the org by email. Leaders only."""
     try:
-        token, invite_id = db.create_invite(
+        token, invite_id = await run_db(
+            db.create_invite,
             tenant_id=current_user.tenant_id,
             email=payload.email,
             role=payload.role,
@@ -1010,9 +1198,17 @@ async def update_member_role(
     current_user: UserSession = Depends(require_leader),
 ):
     """Update a member's role. Leaders can only set member/leader."""
-    ok = db.update_member_role(current_user.tenant_id, profile_id, payload.role)
+    ok = await run_db(db.update_member_role, current_user.tenant_id, profile_id, payload.role)
     if not ok:
         raise HTTPException(status_code=404, detail="Member not found.")
+    await _audit(
+        request,
+        current_user,
+        "org.member.update_role",
+        target_type="user_profile",
+        target_id=profile_id,
+        after={"role": payload.role},
+    )
     return {"status": "updated", "profile_id": profile_id, "role": payload.role}
 
 
@@ -1025,9 +1221,16 @@ async def remove_member(
 ):
     """Remove a member from the org. Leaders only. Cannot remove last leader."""
     try:
-        ok = db.remove_org_member(current_user.tenant_id, profile_id)
+        ok = await run_db(db.remove_org_member, current_user.tenant_id, profile_id)
         if not ok:
             raise HTTPException(status_code=404, detail="Member not found.")
+        await _audit(
+            request,
+            current_user,
+            "org.member.remove",
+            target_type="user_profile",
+            target_id=profile_id,
+        )
         return {"status": "removed", "profile_id": profile_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1104,7 +1307,15 @@ async def admin_create_company(
     current_user: UserSession = Depends(require_superadmin),
 ):
     """Create a new company/tenant. Superadmin only."""
-    tenant_id = db.create_tenant(payload.company_name, payload.tier)
+    tenant_id = await run_db(db.create_tenant, payload.company_name, payload.tier)
+    await _audit(
+        request,
+        current_user,
+        "admin.company.create",
+        target_type="tenant",
+        target_id=str(tenant_id),
+        after={"company_name": payload.company_name, "tier": payload.tier},
+    )
     return {"id": tenant_id, "company_name": payload.company_name, "tier": payload.tier}
 
 
@@ -1132,9 +1343,19 @@ async def admin_assign_leader(
 ):
     """Invite a leader to a company. Superadmin only."""
     try:
-        token, invite_id = db.assign_leader_to_tenant(tenant_id, payload.email, current_user.user_id)
+        token, invite_id = await run_db(
+            db.assign_leader_to_tenant, tenant_id, payload.email, current_user.user_id
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    await _audit(
+        request,
+        current_user,
+        "admin.company.assign_leader",
+        target_type="tenant",
+        target_id=tenant_id,
+        metadata={"email": payload.email},
+    )
     return {
         "id": invite_id,
         "token": token,
@@ -1168,9 +1389,17 @@ async def admin_update_user_role(
     current_user: UserSession = Depends(require_superadmin),
 ):
     """Change any user's role globally. Superadmin only."""
-    ok = db.update_any_user_role(profile_id, payload.role)
+    ok = await run_db(db.update_any_user_role, profile_id, payload.role)
     if not ok:
         raise HTTPException(status_code=404, detail="User not found.")
+    await _audit(
+        request,
+        current_user,
+        "admin.user.update_role",
+        target_type="user_profile",
+        target_id=profile_id,
+        after={"role": payload.role},
+    )
     return {"status": "updated", "profile_id": profile_id, "role": payload.role}
 
 
@@ -1182,9 +1411,16 @@ async def admin_delete_user(
     current_user: UserSession = Depends(require_superadmin),
 ):
     """Delete any user globally. Superadmin only."""
-    ok = db.delete_any_user(profile_id)
+    ok = await run_db(db.delete_any_user, profile_id)
     if not ok:
         raise HTTPException(status_code=404, detail="User not found.")
+    await _audit(
+        request,
+        current_user,
+        "admin.user.delete",
+        target_type="user_profile",
+        target_id=profile_id,
+    )
     return {"status": "deleted", "profile_id": profile_id}
 
 
@@ -1227,14 +1463,49 @@ async def admin_upsert_pricing(
 ):
     """Create or update pricing for a model. Superadmin only."""
     try:
-        row = db.upsert_model_pricing(
+        before = await run_db(db.get_pricing)
+        before_row = before.get(payload.model_identifier)
+        row = await run_db(
+            db.upsert_model_pricing,
             payload.model_identifier,
             payload.input_credits,
             payload.output_credits,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    await _audit(
+        request,
+        current_user,
+        "admin.pricing.upsert",
+        target_type="model_pricing",
+        target_id=payload.model_identifier,
+        before=({"input": before_row["input"], "output": before_row["output"]} if before_row else None),
+        after={"input_credits": payload.input_credits, "output_credits": payload.output_credits},
+    )
     return {"status": "updated", "pricing": row}
+
+
+@app.get("/api/v1/admin/audit-log")
+@limiter.limit("60/minute")
+async def admin_list_audit_log(
+    request: Request,
+    actor_user_id: str | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Read recent audit-log rows. Superadmin only."""
+    rows = await run_db(
+        db.list_audit_log,
+        actor_user_id=actor_user_id,
+        target_type=target_type,
+        target_id=target_id,
+        limit=limit,
+        offset=offset,
+    )
+    return {"entries": rows}
 
 
 # ── Chat Sessions (Authenticated, per-user) ───────────────────────

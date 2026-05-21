@@ -7,17 +7,23 @@
  *     browser; private key stays in env (SERVER_ECDH_PRIV_HEX).
  *   - Per request, client generates an ephemeral keypair, performs ECDH,
  *     derives an AES-256-GCM key with HKDF-SHA256, and encrypts the body.
- *   - Server reverses the process. Same derived key is reused to encrypt the
- *     response (one-shot session, fresh nonce).
+ *   - The route's pathname is mixed into the AES-GCM Additional Authenticated
+ *     Data (AAD), so an envelope captured at /api/me cannot be replayed at
+ *     /api/auth/login — they decrypt to garbage.
+ *   - The plaintext carries a Unix-millisecond timestamp; the server rejects
+ *     anything outside ±60s, blocking replay attacks.
  *
  * Wire format:
  *   request:  { v:1, epk:b64, n:b64, c:b64 }
+ *   plaintext (request): { ts: <number>, body: <unknown> }
  *   response: { n:b64, c:b64 }
+ *   plaintext (response): the JSON-serialisable handler result
  */
 
 import crypto from "node:crypto";
 
 const HKDF_INFO = Buffer.from("quintal-wire-v1", "utf-8");
+const REPLAY_WINDOW_MS = 60_000;
 
 const SERVER_PRIV_HEX = process.env.SERVER_ECDH_PRIV_HEX || "";
 
@@ -47,16 +53,32 @@ function bufToB64(b: Buffer | Uint8Array): string {
   return Buffer.from(b).toString("base64");
 }
 
+function pathAad(path: string): Buffer {
+  // Bind the request path into the AAD so an envelope can't be replayed
+  // against a different endpoint. We strip query parameters because clients
+  // (and our own apiFetch) can append cache-busters and the wire-method
+  // fallback parameter.
+  const noQuery = (path || "").split("?")[0] || "/";
+  return Buffer.from(`path:${noQuery}`, "utf-8");
+}
+
+export interface OpenedEnvelope {
+  body: unknown;
+  seal: (data: unknown) => { n: string; c: string };
+}
+
 /**
- * Decrypt a request envelope and return the parsed JSON plaintext along with
- * a sealer that can be used to encrypt the corresponding response.
+ * Decrypt a request envelope, validate the embedded timestamp against the
+ * replay window, and return both the parsed JSON plaintext and a sealer that
+ * encrypts the corresponding response (with a fresh nonce, same key).
+ *
+ * Pass the route path as ``pathForAad`` so AAD-binding can reject envelopes
+ * captured against a different URL.
  */
-export function openRequest(envelope: {
-  v?: number;
-  epk?: string;
-  n?: string;
-  c?: string;
-}): { body: unknown; seal: (data: unknown) => { n: string; c: string } } {
+export function openRequest(
+  envelope: { v?: number; epk?: string; n?: string; c?: string },
+  pathForAad: string
+): OpenedEnvelope {
   if (!envelope || !envelope.epk || !envelope.n || !envelope.c) {
     throw new Error("Bad envelope.");
   }
@@ -71,33 +93,57 @@ export function openRequest(envelope: {
   if (nonce.length !== 12) throw new Error("Bad nonce.");
   if (ct.length < 16) throw new Error("Bad ciphertext.");
 
-  // ECDH shared secret
   const shared = getServerEcdh().computeSecret(clientPub);
-
-  // HKDF-SHA256 → 32-byte AES-GCM key. Salt = client ephemeral pub key.
   const aesKey = Buffer.from(
     crypto.hkdfSync("sha256", shared, clientPub, HKDF_INFO, 32) as ArrayBuffer
   );
 
-  // AES-256-GCM decrypt (last 16 bytes are the GCM tag)
+  const aad = pathAad(pathForAad);
   const tag = ct.subarray(ct.length - 16);
   const ctOnly = ct.subarray(0, ct.length - 16);
   const decipher = crypto.createDecipheriv("aes-256-gcm", aesKey, nonce);
+  decipher.setAAD(aad);
   decipher.setAuthTag(tag);
-  const ptBuf = Buffer.concat([decipher.update(ctOnly), decipher.final()]);
 
-  let body: unknown = null;
+  let ptBuf: Buffer;
+  try {
+    ptBuf = Buffer.concat([decipher.update(ctOnly), decipher.final()]);
+  } catch {
+    // GCM tag mismatch -> wrong key, tampered ciphertext, or wrong AAD (replay).
+    throw new Error("Envelope authentication failed.");
+  }
+
+  let plaintext: unknown = null;
   if (ptBuf.length > 0) {
     try {
-      body = JSON.parse(ptBuf.toString("utf-8"));
+      plaintext = JSON.parse(ptBuf.toString("utf-8"));
     } catch {
-      body = ptBuf.toString("utf-8");
+      plaintext = ptBuf.toString("utf-8");
     }
   }
+
+  // Reject stale or forward-dated envelopes: replay protection.
+  const ts =
+    plaintext && typeof plaintext === "object" && "ts" in (plaintext as Record<string, unknown>)
+      ? (plaintext as { ts?: unknown }).ts
+      : undefined;
+  if (typeof ts !== "number" || !Number.isFinite(ts)) {
+    throw new Error("Missing or invalid timestamp.");
+  }
+  const skew = Math.abs(Date.now() - ts);
+  if (skew > REPLAY_WINDOW_MS) {
+    throw new Error("Envelope outside replay window.");
+  }
+
+  const body =
+    plaintext && typeof plaintext === "object" && "body" in (plaintext as Record<string, unknown>)
+      ? (plaintext as { body?: unknown }).body
+      : null;
 
   function seal(data: unknown): { n: string; c: string } {
     const respNonce = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv("aes-256-gcm", aesKey, respNonce);
+    cipher.setAAD(aad);
     const text = data === undefined ? "" : JSON.stringify(data);
     const enc = Buffer.concat([cipher.update(Buffer.from(text, "utf-8")), cipher.final()]);
     const t = cipher.getAuthTag();

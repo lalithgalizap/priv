@@ -1850,3 +1850,117 @@ def allocate_member_extra_credits(tenant_id: str, supabase_auth_id: str, amount:
                 "extra_allocated": int(member_row["paid_credit_balance"]) if member_row else 0,
                 "org_pool_remaining": pool - amount,
             }
+
+
+
+# ── Audit Log ────────────────────────────────────────────────────
+
+
+def init_audit_log_table() -> None:
+    """Create the append-only audit_log table if it does not exist."""
+    sql = """
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        actor_user_id VARCHAR(150),
+        actor_email VARCHAR(255),
+        actor_role VARCHAR(50),
+        actor_ip VARCHAR(64),
+        request_id VARCHAR(64),
+        action VARCHAR(120) NOT NULL,
+        target_type VARCHAR(80),
+        target_id VARCHAR(150),
+        before JSONB,
+        after JSONB,
+        metadata JSONB
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log (ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor_user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log (target_type, target_id);
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def write_audit_log(
+    *,
+    actor_user_id: str | None,
+    actor_email: str | None,
+    actor_role: str | None,
+    actor_ip: str | None,
+    request_id: str | None,
+    action: str,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    before: dict | None = None,
+    after: dict | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Append a single audit row. Best-effort; never raises to the caller."""
+    import json as _json
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO audit_log (
+                        actor_user_id, actor_email, actor_role, actor_ip,
+                        request_id, action, target_type, target_id,
+                        before, after, metadata
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
+                    """,
+                    (
+                        actor_user_id,
+                        actor_email,
+                        actor_role,
+                        actor_ip,
+                        request_id,
+                        action,
+                        target_type,
+                        target_id,
+                        _json.dumps(before) if before is not None else None,
+                        _json.dumps(after) if after is not None else None,
+                        _json.dumps(metadata) if metadata is not None else None,
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning("Audit log write failed: %s", e)
+
+
+def list_audit_log(
+    *,
+    actor_user_id: str | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """Read recent audit rows, newest first. Used by the admin UI."""
+    where: list[str] = []
+    params: list = []
+    if actor_user_id:
+        where.append("actor_user_id = %s")
+        params.append(actor_user_id)
+    if target_type:
+        where.append("target_type = %s")
+        params.append(target_type)
+    if target_id:
+        where.append("target_id = %s")
+        params.append(target_id)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    sql = f"""
+        SELECT id, ts, actor_user_id, actor_email, actor_role, actor_ip,
+               request_id, action, target_type, target_id, before, after, metadata
+        FROM audit_log
+        {where_sql}
+        ORDER BY ts DESC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]

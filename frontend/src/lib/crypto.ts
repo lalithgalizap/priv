@@ -7,7 +7,11 @@
  *   - Generate ephemeral P-256 keypair per request
  *   - ECDH against the server's static public key
  *   - HKDF-SHA256 → 32-byte AES-256-GCM key
- *   - Encrypt request, decrypt response with same derived key
+ *   - The request URL path is mixed into AES-GCM Additional Authenticated
+ *     Data (AAD) so a captured envelope cannot be replayed against a
+ *     different endpoint.
+ *   - Plaintext carries a millisecond timestamp; the server enforces a
+ *     ±60s replay window.
  */
 
 const HKDF_INFO_BYTES = new TextEncoder().encode("quintal-wire-v1");
@@ -27,6 +31,11 @@ function bytesToB64(bytes: Uint8Array | ArrayBuffer): string {
   let s = "";
   for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
   return btoa(s);
+}
+
+function pathAad(path: string): Uint8Array {
+  const noQuery = (path || "").split("?")[0] || "/";
+  return new TextEncoder().encode(`path:${noQuery}`);
 }
 
 async function importServerPub(serverPubB64: string): Promise<CryptoKey> {
@@ -51,7 +60,6 @@ async function deriveAesKey(
   pubKey: CryptoKey,
   salt: Uint8Array
 ): Promise<CryptoKey> {
-  // ECDH → 256-bit shared secret
   const sharedBits = await crypto.subtle.deriveBits(
     { name: "ECDH", public: pubKey },
     privKey,
@@ -85,16 +93,18 @@ export interface ResponseEnvelope {
 }
 
 /**
- * Seal a JSON-serialisable plaintext into a request envelope. Returns the
- * envelope plus the AES key needed to decrypt the matching response.
+ * Seal a JSON-serialisable plaintext into a request envelope.
+ *
+ * The plaintext is wrapped as ``{ ts, body }`` so the server can enforce a
+ * replay window. The route path is bound into AES-GCM AAD.
  */
 export async function sealRequest(
   serverPubB64: string,
-  plaintext: unknown
-): Promise<{ envelope: RequestEnvelope; aesKey: CryptoKey }> {
+  pathForAad: string,
+  body: unknown
+): Promise<{ envelope: RequestEnvelope; aesKey: CryptoKey; aad: Uint8Array }> {
   const serverPub = await importServerPub(serverPubB64);
 
-  // Fresh ephemeral keypair — extractable so we can export the raw pubkey.
   const ephemeral = await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" },
     true,
@@ -106,12 +116,17 @@ export async function sealRequest(
 
   const aesKey = await deriveAesKey(ephemeral.privateKey, serverPub, ephPubRaw);
   const nonce = crypto.getRandomValues(new Uint8Array(12));
-  const ptBytes = new TextEncoder().encode(
-    plaintext === undefined ? "" : JSON.stringify(plaintext)
-  );
+  const aad = pathAad(pathForAad);
+
+  const wrapped = { ts: Date.now(), body: body ?? null };
+  const ptBytes = new TextEncoder().encode(JSON.stringify(wrapped));
   const ct = new Uint8Array(
     await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: nonce as BufferSource },
+      {
+        name: "AES-GCM",
+        iv: nonce as BufferSource,
+        additionalData: aad as BufferSource,
+      },
       aesKey,
       ptBytes as BufferSource
     )
@@ -125,13 +140,15 @@ export async function sealRequest(
       c: bytesToB64(ct),
     },
     aesKey,
+    aad,
   };
 }
 
-/** Decrypt a response envelope using the AES key from sealRequest(). */
+/** Decrypt a response envelope using the AES key and AAD from sealRequest(). */
 export async function openResponse(
   envelope: ResponseEnvelope,
-  aesKey: CryptoKey
+  aesKey: CryptoKey,
+  aad: Uint8Array
 ): Promise<unknown> {
   if (!envelope || !envelope.n || !envelope.c) {
     throw new Error("Bad response envelope.");
@@ -140,7 +157,11 @@ export async function openResponse(
   const ct = b64ToBytes(envelope.c);
   const pt = new Uint8Array(
     await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: nonce as BufferSource },
+      {
+        name: "AES-GCM",
+        iv: nonce as BufferSource,
+        additionalData: aad as BufferSource,
+      },
       aesKey,
       ct as BufferSource
     )

@@ -3,44 +3,63 @@
 Validates the Bearer token against Supabase's JWKS endpoint and resolves the
 calling user's tenant + role from our DB.
 
-Hardened for production:
-- JWKS stale-cache fallback is capped at JWKS_MAX_STALE_SECONDS (default 6h);
-  after that we fail closed rather than accepting tokens we can't re-verify.
-- JWK → PEM conversion uses the `cryptography` library (already a dep) so we
-  support both EC P-256 (Supabase default) and RSA out of the box.
-- pyjwt.decode runs with a 30s leeway to tolerate small clock skew between
-  Supabase auth and this host. Larger drift is surfaced via /health.
+Production hardening:
+- JWKS stale cache is capped at JWKS_MAX_STALE_SECONDS (default 6h);
+  beyond that we fail closed.
+- JWK → PEM uses the cryptography library (EC P-256 + RSA).
+- pyjwt.decode runs with a 30s leeway; larger drift surfaces via /health.
+- Optional **fingerprint pinning**: if SUPABASE_JWKS_FINGERPRINTS is set
+  (comma-separated SHA-256 hex digests over the JSON-canonicalised JWK),
+  we reject any key whose fingerprint isn't on the list. This protects
+  against a compromised Supabase JWKS endpoint serving rogue keys.
+- Logger context is bound (user_id, tenant_id) so every log line emitted
+  during auth-aware request handling is auto-tagged.
 """
 
-import logging
-import os
+from __future__ import annotations
+
+import asyncio
 import base64
 import json
+import os
 import re
 import threading
 import time
-import urllib.request
+import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
+import httpx
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature  # noqa: F401 (kept for type discoverability)
-
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt as pyjwt
 from pydantic import BaseModel
 
 import db
+from logging_config import (
+    hash_id,
+    tenant_id_var,
+    user_id_var,
+)
+import logging
 
 logger = logging.getLogger("auth")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-JWKS_CACHE_TTL_SECONDS = 1800  # 30 min — re-fetch happily within this window
-JWKS_MAX_STALE_SECONDS = int(os.getenv("JWKS_MAX_STALE_SECONDS", "21600"))  # 6 hours hard cap
-JWT_LEEWAY_SECONDS = 30
+JWKS_CACHE_TTL_SECONDS = int(os.getenv("JWKS_CACHE_TTL_SECONDS", "1800"))
+JWKS_MAX_STALE_SECONDS = int(os.getenv("JWKS_MAX_STALE_SECONDS", "21600"))
+JWT_LEEWAY_SECONDS = int(os.getenv("JWT_LEEWAY_SECONDS", "30"))
+
+# Optional security: comma-separated SHA-256 fingerprints of JWKs we trust.
+# Empty = trust any key Supabase serves (current behaviour).
+_PINNED_FPS = {
+    fp.strip().lower()
+    for fp in os.getenv("SUPABASE_JWKS_FINGERPRINTS", "").split(",")
+    if fp.strip()
+}
 
 
 @dataclass
@@ -51,6 +70,9 @@ class _JwksState:
 
 _jwks_state: Optional[_JwksState] = None
 _jwks_lock = threading.Lock()
+# Async-aware lock used inside the FastAPI event loop to prevent multiple
+# concurrent refresh fetches from racing.
+_jwks_async_lock = asyncio.Lock()
 
 
 def _b64url_decode(val: str) -> bytes:
@@ -60,62 +82,82 @@ def _b64url_decode(val: str) -> bytes:
     return base64.urlsafe_b64decode(val)
 
 
-def _fetch_jwks_remote() -> Optional[dict]:
-    """Attempt to fetch the JWKS document from Supabase. Returns None on failure."""
+def _jwk_fingerprint(jwk: dict) -> str:
+    """Stable SHA-256 fingerprint over a JWK's canonical JSON form."""
+    # Sort keys to make the digest stable regardless of dict ordering.
+    canonical = json.dumps(jwk, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _fetch_jwks_remote() -> Optional[dict]:
+    """Fetch the JWKS document via httpx.AsyncClient. Returns None on failure."""
     if not SUPABASE_URL:
         return None
+    from async_io import get_http_client
+
+    client = get_http_client()
     urls = [
         f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json",
         f"{SUPABASE_URL}/.well-known/jwks.json",
     ]
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                doc = json.loads(resp.read().decode("utf-8"))
-                logger.info("Loaded %d JWKS keys from %s", len(doc.get("keys", [])), url)
+            resp = await client.get(url, headers={"Accept": "application/json"})
+            if resp.status_code == 200:
+                doc = resp.json()
+                logger.info(
+                    "Loaded JWKS",
+                    extra={"jwks_url": url, "key_count": len(doc.get("keys", []))},
+                )
                 return doc
+            logger.warning(
+                "JWKS fetch returned non-200",
+                extra={"jwks_url": url, "status": resp.status_code},
+            )
         except Exception as e:
-            logger.warning("Failed to fetch JWKS from %s: %s", url, e)
+            logger.warning(
+                "JWKS fetch failed",
+                extra={"jwks_url": url, "error": str(e)},
+            )
     return None
 
 
-def _get_jwks() -> Optional[dict]:
-    """Return the currently-trusted JWKS, refreshing if expired.
-
-    Stale cache (older than the TTL but younger than the hard max) is allowed
-    while we attempt a re-fetch; if the re-fetch fails we fall back to the
-    stale copy. Anything older than ``JWKS_MAX_STALE_SECONDS`` is discarded
-    and we fail closed.
-    """
+async def _get_jwks_async() -> Optional[dict]:
+    """Async refresh path. Used inside the FastAPI request lifecycle."""
     global _jwks_state
     now = time.time()
 
-    with _jwks_lock:
+    state = _jwks_state
+    if state and (now - state.fetched_at) < JWKS_CACHE_TTL_SECONDS:
+        return state.keys
+
+    async with _jwks_async_lock:
+        # Re-check after acquiring lock — another coroutine may have refreshed.
         state = _jwks_state
         if state and (now - state.fetched_at) < JWKS_CACHE_TTL_SECONDS:
             return state.keys
 
-        # Either no cache or it's beyond the soft TTL — try a fresh fetch.
-        fresh = _fetch_jwks_remote()
+        fresh = await _fetch_jwks_remote()
         if fresh is not None:
-            _jwks_state = _JwksState(keys=fresh, fetched_at=now)
+            with _jwks_lock:
+                _jwks_state = _JwksState(keys=fresh, fetched_at=now)
             return fresh
 
-        # Fresh fetch failed; only use stale cache if within the hard window.
+        # Fresh fetch failed — fall back to stale within the hard window.
         if state and (now - state.fetched_at) < JWKS_MAX_STALE_SECONDS:
             logger.warning(
-                "Using stale JWKS cache (age=%.0fs)",
-                now - state.fetched_at,
+                "Using stale JWKS cache",
+                extra={"age_s": int(now - state.fetched_at)},
             )
             return state.keys
 
         if state:
             logger.error(
-                "JWKS cache exceeded max stale age (%ds). Rejecting tokens until refresh.",
-                JWKS_MAX_STALE_SECONDS,
+                "JWKS cache exceeded max stale; failing closed",
+                extra={"max_stale_s": JWKS_MAX_STALE_SECONDS},
             )
-            _jwks_state = None  # Force fresh attempts every request.
+            with _jwks_lock:
+                _jwks_state = None
         return None
 
 
@@ -127,12 +169,7 @@ def _is_uuid(val: str) -> bool:
 
 
 def _jwk_to_pem(jwk: dict) -> Optional[str]:
-    """Convert a JWK (EC P-256 or RSA) to PEM-encoded SubjectPublicKeyInfo.
-
-    Uses cryptography's ``EllipticCurvePublicNumbers`` / ``RSAPublicNumbers``
-    constructors instead of hand-rolled DER. Supports the formats Supabase has
-    historically used (EC) and may use in the future (RSA).
-    """
+    """Convert a JWK (EC P-256 or RSA) to PEM SubjectPublicKeyInfo."""
     kty = jwk.get("kty")
     try:
         if kty == "EC" and jwk.get("crv") == "P-256":
@@ -144,7 +181,7 @@ def _jwk_to_pem(jwk: dict) -> Optional[str]:
             e = int.from_bytes(_b64url_decode(jwk["e"]), "big")
             pubkey = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
         else:
-            logger.warning("Unsupported JWK kty=%s crv=%s", kty, jwk.get("crv"))
+            logger.warning("Unsupported JWK", extra={"kty": kty, "crv": jwk.get("crv")})
             return None
         pem = pubkey.public_bytes(
             encoding=serialization.Encoding.PEM,
@@ -152,13 +189,12 @@ def _jwk_to_pem(jwk: dict) -> Optional[str]:
         )
         return pem.decode("ascii")
     except Exception as exc:
-        logger.exception("Failed to convert JWK to PEM: %s", exc)
+        logger.exception("JWK→PEM conversion failed", extra={"error": str(exc)})
         return None
 
 
-def _get_key_for_token(token: str) -> Optional[str]:
-    """Get the PEM public key matching the token's kid from JWKS."""
-    jwks = _get_jwks()
+async def _get_key_for_token(token: str) -> Optional[str]:
+    jwks = await _get_jwks_async()
     if not jwks:
         return None
     keys = jwks.get("keys") or []
@@ -173,8 +209,18 @@ def _get_key_for_token(token: str) -> Optional[str]:
 
     token_kid = header.get("kid")
     for jwk in keys:
-        if jwk.get("kid") == token_kid:
-            return _jwk_to_pem(jwk)
+        if jwk.get("kid") != token_kid:
+            continue
+        # Optional fingerprint pinning.
+        if _PINNED_FPS:
+            fp = _jwk_fingerprint(jwk)
+            if fp not in _PINNED_FPS:
+                logger.error(
+                    "Rejecting JWK that does not match pinned fingerprints",
+                    extra={"kid": token_kid, "fingerprint": fp},
+                )
+                return None
+        return _jwk_to_pem(jwk)
     return None
 
 
@@ -211,7 +257,6 @@ def _resolve_tenant_from_db(user_id: str) -> str | None:
 
 
 def _try_api_key_auth(token: str) -> UserSession | None:
-    """Attempt API key authentication. Returns UserSession on success, None otherwise."""
     try:
         key_data = db.validate_api_key(token)
         if not key_data:
@@ -229,14 +274,14 @@ def _try_api_key_auth(token: str) -> UserSession | None:
             is_platform_admin=False,
         )
     except Exception as e:
-        logger.warning("API key auth failed: %s", e)
+        logger.warning("API key auth failed", extra={"error": str(e)})
         return None
 
 
 security_backend = HTTPBearer()
 
 
-def get_current_user(
+async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Security(security_backend),
 ) -> UserSession:
     token = credentials.credentials
@@ -244,15 +289,17 @@ def get_current_user(
     if token.startswith("ak_"):
         api_user = _try_api_key_auth(token)
         if api_user:
+            user_id_var.set(hash_id(api_user.user_id, "api"))
+            tenant_id_var.set(hash_id(api_user.tenant_id, "tn"))
             return api_user
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key.",
         )
 
-    key = _get_key_for_token(token)
+    key = await _get_key_for_token(token)
     if not key:
-        logger.warning("No matching JWKS key found for token")
+        logger.warning("No matching JWKS key for token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials.",
@@ -268,14 +315,23 @@ def get_current_user(
         )
         user_id = payload.get("sub", "")
         email = payload.get("email", "")
-        db_tenant = _resolve_tenant_from_db(user_id)
+        # Resolve in a worker thread; keeps the loop responsive even when
+        # the DB pool happens to be slow.
+        from async_io import run_db
+
+        db_tenant = await run_db(_resolve_tenant_from_db, user_id)
         if db_tenant:
             tenant_id = db_tenant
         else:
             raw_tenant = payload.get("user_metadata", {}).get("tenant_id", "")
             tenant_id = raw_tenant if _is_uuid(raw_tenant) else db.DEFAULT_TENANT_ID
-        role = _resolve_role(user_id)
-        is_admin = _resolve_is_platform_admin(user_id)
+        role = await run_db(_resolve_role, user_id)
+        is_admin = await run_db(_resolve_is_platform_admin, user_id)
+
+        # Bind log context for the rest of the request.
+        user_id_var.set(hash_id(user_id, "u"))
+        tenant_id_var.set(hash_id(tenant_id, "tn"))
+
         return UserSession(
             user_id=user_id,
             email=email,
@@ -289,13 +345,15 @@ def get_current_user(
             detail="Token has expired.",
         )
     except pyjwt.InvalidTokenError as e:
-        logger.warning("Invalid token: %s: %s", type(e).__name__, e)
+        logger.warning("Invalid token", extra={"error_type": type(e).__name__, "error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials.",
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("JWT verification error: %s: %s", type(e).__name__, e)
+        logger.error("JWT verification error", extra={"error_type": type(e).__name__, "error": str(e)})
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials.",
@@ -309,7 +367,7 @@ class RoleChecker:
     def __init__(self, allowed_roles: list[str]):
         self.allowed_roles = allowed_roles
 
-    def __call__(self, user: UserSession = Security(get_current_user)) -> UserSession:
+    async def __call__(self, user: UserSession = Security(get_current_user)) -> UserSession:
         if user.role not in self.allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -322,7 +380,7 @@ require_leader = RoleChecker(["superadmin", "leader"])
 require_member = RoleChecker(["superadmin", "leader", "member"])
 
 
-def require_superadmin(user: UserSession = Security(get_current_user)) -> UserSession:
+async def require_superadmin(user: UserSession = Security(get_current_user)) -> UserSession:
     if user.role != "superadmin" and not user.is_platform_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

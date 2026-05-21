@@ -22,7 +22,8 @@ export async function POST(request: NextRequest) {
   let body: SignupBody;
   let seal: (data: unknown) => { n: string; c: string };
   try {
-    const opened = openRequest(envelope);
+    const url = new URL(request.url);
+    const opened = openRequest(envelope, url.pathname);
     body = (opened.body || {}) as SignupBody;
     seal = opened.seal;
   } catch (e) {
