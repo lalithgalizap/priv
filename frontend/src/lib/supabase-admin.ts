@@ -147,9 +147,15 @@ export async function logout(access_token: string): Promise<void> {
 
 export async function updatePasswordWithToken(
   access_token: string,
-  new_password: string
+  new_password: string,
+  current_password?: string,
 ): Promise<{ ok: true } | { ok: false; status: number; message: string }> {
   const url = `${SUPABASE_URL}/auth/v1/user`;
+  // Supabase Auth requires ``current_password`` alongside the new password
+  // for a secure password change. The access token alone is not enough.
+  const payload: Record<string, string> = { password: new_password };
+  if (current_password) payload.current_password = current_password;
+
   const res = await fetch(url, {
     method: "PUT",
     headers: {
@@ -157,7 +163,7 @@ export async function updatePasswordWithToken(
       Authorization: `Bearer ${access_token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ password: new_password }),
+    body: JSON.stringify(payload),
   });
   if (res.status >= 400) {
     const data = await res.json().catch(() => ({}));

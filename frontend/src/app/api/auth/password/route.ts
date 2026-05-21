@@ -122,7 +122,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const updated = await updatePasswordWithToken(reauth.session.access_token, body.new_password);
+  const updated = await updatePasswordWithToken(
+    reauth.session.access_token,
+    body.new_password,
+    body.current_password,
+  );
   if (!updated.ok) {
     return NextResponse.json(seal({ error: updated.message }), { status: updated.status });
   }
