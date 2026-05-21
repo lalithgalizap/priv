@@ -9,6 +9,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { openRequest } from "@/lib/server-crypto";
 import { signInWithPassword, updatePasswordWithToken, getUserFromToken } from "@/lib/supabase-admin";
 import { cookieNames, setSessionCookies } from "@/lib/cookies";
+import { sendEmail } from "@/lib/email";
+import { passwordChangedTemplate } from "@/lib/email-templates";
 
 interface ChangeBody {
   current_password?: string;
@@ -40,8 +42,11 @@ export async function POST(request: NextRequest) {
   if (!body.current_password || !body.new_password) {
     return NextResponse.json(seal({ error: "Missing current or new password." }), { status: 400 });
   }
-  if (body.new_password.length < 6) {
-    return NextResponse.json(seal({ error: "New password must be at least 6 characters." }), { status: 400 });
+  if (body.new_password.length < 8) {
+    return NextResponse.json(seal({ error: "New password must be at least 8 characters." }), { status: 400 });
+  }
+  if (!/[0-9]/.test(body.new_password)) {
+    return NextResponse.json(seal({ error: "New password must contain at least one number." }), { status: 400 });
   }
 
   const access =
@@ -64,6 +69,20 @@ export async function POST(request: NextRequest) {
   const updated = await updatePasswordWithToken(reauth.session.access_token, body.new_password);
   if (!updated.ok) {
     return NextResponse.json(seal({ error: updated.message }), { status: updated.status });
+  }
+
+  // Best-effort confirmation email so users notice unexpected changes.
+  try {
+    const tpl = passwordChangedTemplate({ whenIso: new Date().toISOString() });
+    void sendEmail({
+      to: me.email,
+      subject: tpl.subject,
+      html: tpl.html,
+      text: tpl.text,
+      template: "password_changed",
+    });
+  } catch {
+    // Confirmation email is non-critical; never break the flow.
   }
 
   // Roll the session forward with the freshly authenticated tokens.

@@ -123,6 +123,7 @@ try:
     db.init_db()
     db.ensure_default_tenant()
     db.init_audit_log_table()
+    db.init_email_log_table()
     logger.info("PostgreSQL initialized successfully")
 except Exception as e:
     logger.error("PostgreSQL initialization failed", extra={"error": str(e)})
@@ -272,6 +273,77 @@ async def _audit(
     except Exception as exc:
         # _audit must never break the request; structured-log the failure.
         logger.warning("audit_failed", extra={"action": action, "error": str(exc)})
+
+
+# ── Transactional email helpers ─────────────────────────────────
+
+
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://d2pk46epz4i9kd.cloudfront.net").rstrip("/")
+
+
+async def _send_invite_email(
+    *,
+    tenant_id: str,
+    invitee_email: str,
+    role: str,
+    invite_token: str,
+    inviter_user_id: str | None,
+    template_kind: str = "invite_member",
+) -> None:
+    """Render the invite template and send it via the configured provider.
+
+    Runs as ``asyncio.create_task`` from the calling endpoint so a slow
+    Resend round-trip doesn't add latency to the leader's HTTP response.
+    Always best-effort: every error is logged, none propagate.
+    """
+    try:
+        import email_sender
+        import email_templates
+
+        if not email_sender.is_configured():
+            logger.info(
+                "email_skipped_unconfigured",
+                extra={"template": template_kind, "to_hash": hash_id(invitee_email.lower(), "email")},
+            )
+            return
+
+        tenant_name = (await run_db(db.get_tenant_name, tenant_id)) or "your organization"
+        inviter_name = None
+        if inviter_user_id:
+            inviter_name = await run_db(db.get_user_display_name, inviter_user_id)
+
+        invite_url = f"{APP_BASE_URL}/join?token={invite_token}"
+
+        if template_kind == "assign_leader":
+            tpl = email_templates.assign_leader(
+                invitee_email=invitee_email,
+                tenant_name=tenant_name,
+                invite_url=invite_url,
+                expires_in_days=7,
+            )
+        else:
+            tpl = email_templates.invite_member(
+                invitee_email=invitee_email,
+                tenant_name=tenant_name,
+                inviter_name=inviter_name,
+                role=role,
+                invite_url=invite_url,
+                expires_in_days=7,
+            )
+
+        await email_sender.send_email(
+            to=invitee_email,
+            subject=tpl["subject"],
+            html=tpl["html"],
+            text=tpl["text"],
+            template=template_kind,
+            metadata={"tenant_id": tenant_id, "role": role},
+        )
+    except Exception as exc:
+        logger.warning(
+            "invite_email_send_failed",
+            extra={"template": template_kind, "error": str(exc)},
+        )
 
 # CORS: restrict to known origins only
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
@@ -1169,7 +1241,11 @@ async def invite_member(
     payload: InvitePayload,
     current_user: UserSession = Depends(require_leader),
 ):
-    """Invite a user to the org by email. Leaders only."""
+    """Invite a user to the org by email. Leaders only.
+
+    The invite link is also returned in the response so the UI's "copy link"
+    fallback keeps working when email delivery is delayed.
+    """
     try:
         token, invite_id = await run_db(
             db.create_invite,
@@ -1180,6 +1256,27 @@ async def invite_member(
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    await _audit(
+        request,
+        current_user,
+        "org.member.invite",
+        target_type="tenant_invite",
+        target_id=invite_id,
+        metadata={"email": payload.email, "role": payload.role},
+    )
+
+    # Fire-and-forget email; never block the request on the email provider.
+    asyncio.create_task(
+        _send_invite_email(
+            tenant_id=current_user.tenant_id,
+            invitee_email=payload.email,
+            role=payload.role,
+            invite_token=token,
+            inviter_user_id=current_user.user_id,
+        )
+    )
+
     return {
         "id": invite_id,
         "token": token,
@@ -1356,6 +1453,18 @@ async def admin_assign_leader(
         target_id=tenant_id,
         metadata={"email": payload.email},
     )
+
+    asyncio.create_task(
+        _send_invite_email(
+            tenant_id=tenant_id,
+            invitee_email=payload.email,
+            role="leader",
+            invite_token=token,
+            inviter_user_id=current_user.user_id,
+            template_kind="assign_leader",
+        )
+    )
+
     return {
         "id": invite_id,
         "token": token,

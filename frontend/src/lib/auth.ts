@@ -192,6 +192,28 @@ export async function changePassword(current: string, next: string): Promise<voi
   });
 }
 
+/**
+ * Public — request a password reset email. The response is intentionally
+ * uniform (always ok) so we don't leak which addresses are registered.
+ */
+export async function forgotPassword(email: string): Promise<void> {
+  await apiFetch("/api/auth/forgot-password", {
+    method: "POST",
+    body: { email },
+  });
+}
+
+/**
+ * Public — finalise a password reset using the recovery access_token from
+ * the link in the email.
+ */
+export async function resetPassword(access_token: string, new_password: string): Promise<void> {
+  await apiFetch("/api/auth/reset-password", {
+    method: "POST",
+    body: { access_token, new_password },
+  });
+}
+
 /** Returns a usable access token, refreshing from the cookies if needed. */
 export async function getAccessToken(): Promise<string | null> {
   if (_token && Date.now() < _expiresAt - 30_000) {

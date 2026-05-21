@@ -1964,3 +1964,113 @@ def list_audit_log(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
+
+
+
+# ── Email Log ────────────────────────────────────────────────────
+
+
+def init_email_log_table() -> None:
+    """Create the append-only email_log table if it does not exist."""
+    sql = """
+    CREATE TABLE IF NOT EXISTS email_log (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        to_hash VARCHAR(64) NOT NULL,
+        subject VARCHAR(255),
+        template VARCHAR(80) NOT NULL,
+        status VARCHAR(20) NOT NULL,
+        provider VARCHAR(40),
+        provider_id VARCHAR(120),
+        latency_ms INTEGER,
+        error TEXT,
+        request_id VARCHAR(64),
+        metadata JSONB
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_log_ts ON email_log (ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_email_log_template ON email_log (template, status);
+    CREATE INDEX IF NOT EXISTS idx_email_log_to_hash ON email_log (to_hash);
+    """
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def write_email_log(
+    *,
+    to_email: str,
+    subject: str | None,
+    template: str,
+    status: str,
+    provider: str,
+    provider_id: str | None,
+    latency_ms: int | None,
+    error: str | None,
+    metadata: dict | None,
+    request_id: str | None,
+) -> None:
+    """Append a row to email_log. Best-effort; never raises."""
+    import hashlib
+    import json as _json
+
+    try:
+        to_hash = hashlib.sha256(
+            (to_email or "").lower().encode("utf-8")
+        ).hexdigest()[:32]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO email_log (
+                        to_hash, subject, template, status, provider,
+                        provider_id, latency_ms, error, request_id, metadata
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        to_hash,
+                        (subject or "")[:255],
+                        template,
+                        status,
+                        provider,
+                        provider_id,
+                        latency_ms,
+                        (error or "")[:5000] if error else None,
+                        request_id,
+                        _json.dumps(metadata) if metadata is not None else None,
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning("email_log write failed: %s", e)
+
+
+
+def get_tenant_name(tenant_id: str) -> str | None:
+    """Lookup just the company_name for a tenant. Used by email templates."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT company_name FROM tenants WHERE id = %s",
+                    (tenant_id,),
+                )
+                row = cur.fetchone()
+                return row["company_name"] if row else None
+    except Exception:
+        return None
+
+
+def get_user_display_name(supabase_auth_id: str) -> str | None:
+    """Lookup display_name from user_profiles. Used as the inviter name."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT display_name FROM user_profiles WHERE supabase_auth_id = %s",
+                    (supabase_auth_id,),
+                )
+                row = cur.fetchone()
+                return row["display_name"] if row and row["display_name"] else None
+    except Exception:
+        return None

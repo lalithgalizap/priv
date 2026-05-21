@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import { User, Key, Cpu, Save, Check, Loader2 } from "lucide-react";
 import AppShell from "@/components/AppShell";
-import { authedFetch, changePassword, getCachedUser } from "@/lib/auth";
+import { authedFetch, changePassword, getCachedUser, getAccessToken } from "@/lib/auth";
 import { toast } from "@/lib/toast";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 
@@ -69,15 +69,21 @@ export default function SettingsPage() {
   async function handlePasswordReset(e: React.FormEvent) {
     e.preventDefault();
     setPwError(""); setPwSuccess(false);
-    if (newPassword.length < 6) { setPwError("Password must be at least 6 characters."); return; }
+    if (newPassword.length < 8) { setPwError("Password must be at least 8 characters."); return; }
+    if (!/[0-9]/.test(newPassword)) { setPwError("Password must contain at least one number."); return; }
     if (newPassword !== confirmPassword) { setPwError("Passwords do not match."); return; }
     setPwLoading(true);
     try {
       await changePassword(currentPassword, newPassword);
+      // The HttpOnly cookies were rotated by /api/auth/password. Force the
+      // in-memory token cache to re-read them so subsequent calls don't hit
+      // 401 with the now-invalidated old access token.
+      await getAccessToken();
       setPwSuccess(true);
       setCurrentPassword("");
       setNewPassword("");
       setConfirmPassword("");
+      toast.success("Password updated", "We sent a confirmation email to your inbox.");
     } catch (err) {
       setPwError(err instanceof Error ? err.message : "Failed to update password.");
     } finally {
@@ -127,12 +133,13 @@ export default function SettingsPage() {
             </div>
             <div>
               <label className="text-xs text-outline-variant block mb-1.5">New Password</label>
-              <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required minLength={6}
+              <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} required minLength={8}
                 className="w-full bg-surface-container-low/50 border border-outline-variant/20 rounded-lg px-3 py-2.5 text-sm text-on-surface focus:outline-none focus:border-primary" />
+              <p className="text-[10px] text-outline-variant mt-1">At least 8 characters with at least one number.</p>
             </div>
             <div>
               <label className="text-xs text-outline-variant block mb-1.5">Confirm New Password</label>
-              <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required minLength={6}
+              <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required minLength={8}
                 className="w-full bg-surface-container-low/50 border border-outline-variant/20 rounded-lg px-3 py-2.5 text-sm text-on-surface focus:outline-none focus:border-primary" />
             </div>
             {pwError && <p className="text-xs text-error">{pwError}</p>}

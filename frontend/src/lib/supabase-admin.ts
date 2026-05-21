@@ -173,6 +173,61 @@ export async function updatePasswordWithToken(
   return { ok: true };
 }
 
+/**
+ * Generate a recovery link for ``email`` via the Supabase Admin API.
+ *
+ * We use the admin generate-link endpoint instead of /auth/v1/recover so the
+ * backend hands us the URL directly (Supabase doesn't auto-send when we use
+ * its built-in mail templates AND we want to send via Resend with our own
+ * branding). The action_link Supabase returns includes the recovery token
+ * as a fragment; we route it through our own /reset-password page.
+ *
+ * Always succeeds with ok:true even on unknown email — we don't want to
+ * leak which addresses exist. Provider-side errors are logged but the
+ * response is uniform.
+ */
+export async function generatePasswordRecoveryLink(
+  email: string,
+  redirectTo: string
+): Promise<{ ok: true; action_link: string | null }> {
+  if (!SUPABASE_SERVICE_KEY) {
+    console.warn("[supabase-admin] SUPABASE_SERVICE_KEY not set; cannot generate recovery link");
+    return { ok: true, action_link: null };
+  }
+  try {
+    const url = `${SUPABASE_URL}/auth/v1/admin/generate_link`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "recovery",
+        email,
+        options: { redirect_to: redirectTo },
+      }),
+    });
+    if (res.status >= 400) {
+      // Treat unknown-email and rate-limit identically to a successful call.
+      // We log for ops visibility but don't surface to caller.
+      const text = await res.text().catch(() => "");
+      console.warn("[supabase-admin] generate_link non-2xx", res.status, text.slice(0, 200));
+      return { ok: true, action_link: null };
+    }
+    const data = (await res.json().catch(() => ({}))) as {
+      action_link?: string;
+      properties?: { action_link?: string };
+    };
+    const link = data.action_link || data.properties?.action_link || null;
+    return { ok: true, action_link: link };
+  } catch (e) {
+    console.warn("[supabase-admin] generate_link crashed", (e as Error).message);
+    return { ok: true, action_link: null };
+  }
+}
+
 export async function getUserFromToken(access_token: string): Promise<SupabaseUser | null> {
   if (!SUPABASE_URL) return null;
   const { status, data } = await authGet("/auth/v1/user", access_token);
