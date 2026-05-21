@@ -161,7 +161,7 @@ export default function ConsolePage() {
             setSessions((prev) =>
               prev.map((s) =>
                 s.id === activeId
-                  ? { ...s, messages: (apiS.messages || []).map((m) => ({ role: m.role, content: m.content, timestamp: m.created_at })) }
+                  ? { ...s, messages: (apiS.messages || []).map((m) => ({ role: m.role, content: decodePayload(m.content), timestamp: m.created_at })) }
                   : s
               )
             );
@@ -207,7 +207,7 @@ export default function ConsolePage() {
         setSessions((prev) =>
           prev.map((s) =>
             s.id === sessionId
-              ? { ...s, messages: (apiS.messages || []).map((m: ApiMessage) => ({ role: m.role, content: m.content, timestamp: m.created_at })) }
+              ? { ...s, messages: (apiS.messages || []).map((m: ApiMessage) => ({ role: m.role, content: decodePayload(m.content), timestamp: m.created_at })) }
               : s
           )
         );
@@ -355,7 +355,7 @@ export default function ConsolePage() {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ role, content }),
+        body: JSON.stringify({ role, content: encodePayload(content) }),
       });
     } catch {
       /* ignore save failures */

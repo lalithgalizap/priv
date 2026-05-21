@@ -1202,6 +1202,10 @@ async def get_session(
     session = db.get_chat_session(session_id, current_user.user_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
+    # Encode message contents for transport
+    if session.get("messages"):
+        for msg in session["messages"]:
+            msg["content"] = transport.encode_payload(msg["content"])
     return {"session": session}
 
 
@@ -1243,11 +1247,14 @@ async def add_message(
     current_user: UserSession = Depends(get_current_user),
 ):
     """Add a message to a chat session."""
+    decoded_content = transport.decode_payload(payload.content)
     msg = db.add_chat_message(
-        session_id, payload.role, payload.content, current_user.user_id
+        session_id, payload.role, decoded_content, current_user.user_id
     )
     if not msg:
         raise HTTPException(status_code=404, detail="Session not found.")
+    # Encode the response content
+    msg["content"] = transport.encode_payload(msg["content"])
     return {"message": msg}
 
 
