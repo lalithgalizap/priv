@@ -89,9 +89,9 @@ const nextConfig: NextConfig = {
     ];
   },
 
-  // Production builds fail on TS/lint errors; dev tolerates them.
+  // Production builds fail on TS errors; dev tolerates them. Lint runs
+  // in CI, not in the build pipeline, so we don't gate next build on it.
   typescript: { ignoreBuildErrors: !isProd },
-  eslint: { ignoreDuringBuilds: !isProd },
 };
 
 export default nextConfig;
