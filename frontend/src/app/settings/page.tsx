@@ -161,13 +161,11 @@ export default function SettingsPage() {
               <select value={preferredModel} onChange={(e) => setPreferredModel(e.target.value)}
                 className="w-full bg-surface-container-low/50 border border-outline-variant/20 rounded-lg px-3 py-2.5 text-sm text-on-surface focus:outline-none focus:border-primary">
                 <option value="moonshotai.kimi-k2.5">Kimi K2.5</option>
-                <option value="deepseek.r1-v1:0">DeepSeek R1</option>
                 <option value="amazon.nova-pro-v1:0">Nova Pro</option>
                 <option value="amazon.nova-lite-v1:0">Nova Lite</option>
                 <option value="cohere.command-r-plus-v1:0">Command R+</option>
                 <option value="meta.llama3-70b-instruct-v1:0">Llama 3 70B</option>
                 <option value="mistral.mistral-large-2402-v1:0">Mistral Large</option>
-                <option value="mistral.mistral-7b-instruct-v0:2">Mistral 7B</option>
                 <option value="amazon.titan-text-premier-v1:0">Titan Text Premier</option>
               </select>
             </div>

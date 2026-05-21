@@ -265,15 +265,22 @@ MIGRATIONS = [
     # ── Seed the new model lineup.
     """
     INSERT INTO model_pricing (model_identifier, input_credits, output_credits) VALUES
-        ('deepseek.r1-v1:0', 14, 22),
         ('amazon.nova-pro-v1:0', 8, 32),
         ('amazon.nova-lite-v1:0', 1, 4),
-        ('cohere.command-r-plus-v1:0', 30, 150),
-        ('mistral.mistral-7b-instruct-v0:2', 2, 5)
+        ('cohere.command-r-plus-v1:0', 30, 150)
     ON CONFLICT (model_identifier) DO UPDATE SET
         input_credits = EXCLUDED.input_credits,
         output_credits = EXCLUDED.output_credits,
         updated_at = CURRENT_TIMESTAMP;
+    """,
+    # ── Drop models that don't work via Bedrock Converse API.
+    # deepseek.r1-v1:0 requires inference profile (no on-demand throughput).
+    # mistral.mistral-7b-instruct-v0:2 is EOL.
+    """
+    DELETE FROM model_pricing WHERE model_identifier IN (
+        'deepseek.r1-v1:0',
+        'mistral.mistral-7b-instruct-v0:2'
+    );
     """,
 ]
 

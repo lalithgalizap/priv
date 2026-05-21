@@ -12,13 +12,11 @@ import LazyMarkdown from "@/components/LazyMarkdown";
 // Used for client-side cost estimation so we don't ping the backend on every keystroke.
 const LOCAL_PRICING_FALLBACK: Record<string, { input: number; output: number }> = {
   "moonshotai.kimi-k2.5": { input: 8, output: 24 },
-  "deepseek.r1-v1:0": { input: 14, output: 22 },
   "amazon.nova-pro-v1:0": { input: 8, output: 32 },
   "amazon.nova-lite-v1:0": { input: 1, output: 4 },
   "cohere.command-r-plus-v1:0": { input: 30, output: 150 },
   "meta.llama3-70b-instruct-v1:0": { input: 10, output: 30 },
   "mistral.mistral-large-2402-v1:0": { input: 20, output: 60 },
-  "mistral.mistral-7b-instruct-v0:2": { input: 2, output: 5 },
   "amazon.titan-text-premier-v1:0": { input: 4, output: 12 },
 };
 const DEFAULT_RATE = { input: 25, output: 100 };
@@ -71,13 +69,11 @@ interface ChatSession {
 
 const MODELS = [
   { id: "moonshotai.kimi-k2.5", label: "Kimi K2.5" },
-  { id: "deepseek.r1-v1:0", label: "DeepSeek R1" },
   { id: "amazon.nova-pro-v1:0", label: "Nova Pro" },
   { id: "amazon.nova-lite-v1:0", label: "Nova Lite" },
   { id: "cohere.command-r-plus-v1:0", label: "Command R+" },
   { id: "meta.llama3-70b-instruct-v1:0", label: "Llama 3 70B" },
   { id: "mistral.mistral-large-2402-v1:0", label: "Mistral Large" },
-  { id: "mistral.mistral-7b-instruct-v0:2", label: "Mistral 7B" },
   { id: "amazon.titan-text-premier-v1:0", label: "Titan Text Premier" },
 ];
 

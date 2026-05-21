@@ -567,10 +567,6 @@ async def _run_ai_mediation(
             )
 
         model_id = model if model else AWS_BEDROCK_MODEL
-        body = {
-            "max_tokens": max_tokens,
-            "messages": messages,
-        }
 
         # ── Atomic credit reservation (DB connection held only for this call) ──
         estimated_input = len(prompt) // 4 + 1
@@ -592,42 +588,56 @@ async def _run_ai_mediation(
                 detail=reservation["reason"],
             )
 
+        # The Bedrock ``Converse`` API normalises every provider to a single
+        # message format, so we don't have to special-case Kimi vs Llama vs
+        # Nova vs Cohere vs Mistral vs Titan body schemas. Models that don't
+        # support on-demand throughput (e.g. DeepSeek R1) still fail; we
+        # surface those errors and the model dropdown is curated to only
+        # expose models we've confirmed work with Converse.
+        converse_messages = []
+        system_blocks = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content", "")
+            if role == "system":
+                if content:
+                    system_blocks.append({"text": content})
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            converse_messages.append({"role": role, "content": [{"text": content}]})
+
         try:
-            # boto3 is synchronous. Offload to the default executor; adaptive
-            # retries are configured on the client itself.
             def _invoke():
-                return client.invoke_model(
-                    modelId=model_id,
-                    body=json.dumps(body),
-                    contentType="application/json",
-                    accept="application/json",
-                )
+                kwargs: dict[str, Any] = {
+                    "modelId": model_id,
+                    "messages": converse_messages,
+                    "inferenceConfig": {"maxTokens": max_tokens, "temperature": 0.7},
+                }
+                if system_blocks:
+                    kwargs["system"] = system_blocks
+                return client.converse(**kwargs)
 
             response = await asyncio.get_event_loop().run_in_executor(None, _invoke)
-            raw = response["body"].read()
-            response_body = json.loads(raw.decode("utf-8"))
 
             ai_response = ""
-            if isinstance(response_body.get("choices"), list) and response_body["choices"]:
-                ai_response = response_body["choices"][0].get("message", {}).get("content", "")
-            elif isinstance(response_body.get("content"), list) and response_body["content"]:
-                ai_response = response_body["content"][0].get("text", "")
-            elif isinstance(response_body.get("output"), str):
-                ai_response = response_body["output"]
-            elif isinstance(response_body.get("completion"), str):
-                ai_response = response_body["completion"]
-            elif isinstance(response_body.get("results"), list) and response_body["results"]:
-                ai_response = response_body["results"][0].get("outputText", "")
-            elif isinstance(response_body.get("generations"), list) and response_body["generations"]:
-                ai_response = response_body["generations"][0].get("text", "")
+            output = response.get("output") or {}
+            message = output.get("message") or {}
+            content_blocks = message.get("content") or []
+            for block in content_blocks:
+                if isinstance(block, dict) and "text" in block:
+                    ai_response += block["text"]
 
             if not ai_response:
-                logger.warning("Empty AI response", extra={"raw_preview": json.dumps(response_body)[:500]})
+                logger.warning(
+                    "Empty AI response",
+                    extra={"raw_preview": json.dumps(response, default=str)[:500]},
+                )
 
-            usage = response_body.get("usage", {})
-            in_tokens = usage.get("input_tokens", usage.get("prompt_tokens", len(prompt.split())))
-            out_tokens = usage.get("output_tokens", usage.get("completion_tokens", 128))
-            tot_tokens = usage.get("total_tokens", in_tokens + out_tokens)
+            usage = response.get("usage") or {}
+            in_tokens = int(usage.get("inputTokens", len(prompt.split())))
+            out_tokens = int(usage.get("outputTokens", 128))
+            tot_tokens = int(usage.get("totalTokens", in_tokens + out_tokens))
         except ClientError as e:
             await run_db(
                 db.release_reserved_credits,

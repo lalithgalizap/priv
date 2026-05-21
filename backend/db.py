@@ -27,8 +27,6 @@ _DEFAULT_MODEL_CREDIT_RATES = {
     "gpt-4o": {"input": 25, "output": 100},
     # Moonshot AI
     "moonshotai.kimi-k2.5": {"input": 8, "output": 24},
-    # DeepSeek
-    "deepseek.r1-v1:0": {"input": 14, "output": 22},
     # Amazon Nova
     "amazon.nova-pro-v1:0": {"input": 8, "output": 32},
     "amazon.nova-lite-v1:0": {"input": 1, "output": 4},
@@ -38,7 +36,6 @@ _DEFAULT_MODEL_CREDIT_RATES = {
     "meta.llama3-70b-instruct-v1:0": {"input": 10, "output": 30},
     # Mistral
     "mistral.mistral-large-2402-v1:0": {"input": 20, "output": 60},
-    "mistral.mistral-7b-instruct-v0:2": {"input": 2, "output": 5},
     # Amazon Titan
     "amazon.titan-text-premier-v1:0": {"input": 4, "output": 12},
 }
