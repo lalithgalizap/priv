@@ -35,7 +35,7 @@ export default function PrivacyPage() {
 
           <section>
             <h2 className="font-sans text-xl font-bold text-white mb-3">4. AI Provider Data Handling</h2>
-            <p>Prompts are forwarded to AWS Bedrock for AI processing. AWS Bedrock does not store or use your prompts for model training. Responses are encrypted before storage in our database.</p>
+            <p>Prompts are forwarded to upstream AI providers for processing. Providers do not store or use your prompts for model training. Responses are encrypted before storage in our database.</p>
           </section>
 
           <section>

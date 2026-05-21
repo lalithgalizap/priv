@@ -22,23 +22,25 @@ DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 # first boot. After that, prices live in the DB and superadmins can edit
 # them via the admin API without redeploys.
 _DEFAULT_MODEL_CREDIT_RATES = {
-    # OpenAI models
+    # OpenAI models (proxied via API gateway, not Bedrock)
     "gpt-4o-mini": {"input": 2, "output": 6},
     "gpt-4o": {"input": 25, "output": 100},
-    # Anthropic Claude models (AWS Bedrock)
-    "anthropic.claude-3-sonnet-20240229-v1:0": {"input": 30, "output": 150},
-    "claude-3-5-sonnet": {"input": 30, "output": 150},
-    "anthropic.claude-3-haiku-20240307-v1:0": {"input": 4, "output": 15},
-    "anthropic.claude-3-opus-20240229-v1:0": {"input": 150, "output": 750},
-    "claude-3-opus": {"input": 150, "output": 750},
-    # Meta Llama models (AWS Bedrock)
-    "meta.llama3-70b-instruct-v1:0": {"input": 10, "output": 30},
-    # Mistral models (AWS Bedrock)
-    "mistral.mistral-large-2402-v1:0": {"input": 20, "output": 60},
-    # Amazon Titan models (AWS Bedrock)
-    "amazon.titan-text-premier-v1:0": {"input": 4, "output": 12},
-    # Moonshot AI models (AWS Bedrock)
+    # Moonshot AI
     "moonshotai.kimi-k2.5": {"input": 8, "output": 24},
+    # DeepSeek
+    "deepseek.r1-v1:0": {"input": 14, "output": 22},
+    # Amazon Nova
+    "amazon.nova-pro-v1:0": {"input": 8, "output": 32},
+    "amazon.nova-lite-v1:0": {"input": 1, "output": 4},
+    # Cohere
+    "cohere.command-r-plus-v1:0": {"input": 30, "output": 150},
+    # Meta Llama
+    "meta.llama3-70b-instruct-v1:0": {"input": 10, "output": 30},
+    # Mistral
+    "mistral.mistral-large-2402-v1:0": {"input": 20, "output": 60},
+    "mistral.mistral-7b-instruct-v0:2": {"input": 2, "output": 5},
+    # Amazon Titan
+    "amazon.titan-text-premier-v1:0": {"input": 4, "output": 12},
 }
 DEFAULT_CREDIT_RATE = {"input": 25, "output": 100}  # safety net
 

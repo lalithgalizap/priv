@@ -25,7 +25,7 @@ export default function TermsPage() {
 
           <section>
             <h2 className="font-sans text-xl font-bold text-white mb-3">2. Service Description</h2>
-            <p>Quintal AI provides an enterprise AI mediation platform that routes prompts to AI models via AWS Bedrock. The service includes credit-based usage management, team collaboration features, and encrypted data storage.</p>
+            <p>Quintal AI provides an enterprise AI mediation platform that routes prompts to AI models on our behalf. The service includes credit-based usage management, team collaboration features, and encrypted data storage.</p>
           </section>
 
           <section>

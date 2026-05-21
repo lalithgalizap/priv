@@ -556,7 +556,7 @@ async def _run_ai_mediation(
         await asyncio.sleep(0.3)
         ai_response = (
             "[MOCK RESPONSE] AI provider not configured. "
-            "Set AWS Bedrock credentials to enable real responses."
+            "Configure provider credentials to enable real responses."
         )
     else:
         client = get_bedrock_client()

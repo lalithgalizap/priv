@@ -34,9 +34,9 @@ rationale on individual choices see [`adr/`](./adr/).
                               ┌───────┴───────┐
                               ▼               ▼
                   ┌────────────────┐    ┌──────────────────┐
-                  │   Supabase     │    │  AWS Bedrock     │
-                  │   (Postgres,   │    │  (Kimi K2.5,     │
-                  │    Auth, JWKS) │    │   Claude, etc.)  │
+                  │   Supabase     │    │   AI Providers   │
+                  │   (Postgres,   │    │   (Kimi, Nova,   │
+                  │    Auth, JWKS) │    │    Llama, etc.)  │
                   └────────────────┘    └──────────────────┘
 ```
 
