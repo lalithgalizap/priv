@@ -112,9 +112,11 @@ async function verifyOrRefreshToken(): Promise<string | null> {
   if (!token) return fetchSession();
 
   try {
+    // Logical GET — apiFetch handles the wire method and the
+    // ?_wm=GET query parameter internally.
     await apiFetch("/api/me", {
-      method: "POST", // wire method; /api/me handler dispatches X-Wire-Method=GET internally
-      headers: { "X-Wire-Method": "GET", Authorization: `Bearer ${token}` },
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
     });
     return token;
   } catch (err) {
