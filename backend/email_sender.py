@@ -3,12 +3,23 @@
 A single ``send_email(to, subject, html, text)`` entry point. The active
 provider is selected by the ``EMAIL_PROVIDER`` env var:
 
-- ``resend`` — production-friendly REST API. Requires ``RESEND_API_KEY``.
+- ``resend``  — production-friendly REST API. Requires ``RESEND_API_KEY``.
+- ``smtp``    — generic SMTP (Gmail, SES, Mailgun, etc.). Required env:
+                ``SMTP_HOST`` (e.g. ``smtp.gmail.com``)
+                ``SMTP_PORT`` (587 for STARTTLS, 465 for implicit TLS)
+                ``SMTP_USERNAME``
+                ``SMTP_PASSWORD``
+                Optional: ``SMTP_USE_TLS`` (default true), ``SMTP_USE_SSL``.
+                For Gmail use an App Password
+                (https://myaccount.google.com/apppasswords) and ensure
+                ``EMAIL_FROM``'s address equals ``SMTP_USERNAME``, or Gmail
+                will silently rewrite it.
 - ``console`` — local dev fallback. Logs the email instead of sending.
 
 All sends:
 
-- Use the bounded async-IO HTTP client (timeouts, connection pooling).
+- Use the bounded async-IO HTTP client for HTTP providers; SMTP runs in a
+  threadpool so the asyncio loop doesn't block.
 - Append an ``email_log`` row regardless of outcome (status, latency, error).
 - Return a small dict so callers can decide what to do on failure (audit log,
   retry, etc.) but do not raise for non-2xx responses; the email path must
@@ -19,7 +30,10 @@ from __future__ import annotations
 
 import logging
 import os
+import smtplib
+import ssl
 import time
+from email.message import EmailMessage
 from typing import Optional
 
 import httpx
@@ -32,7 +46,18 @@ logger = logging.getLogger("email")
 EMAIL_PROVIDER = os.getenv("EMAIL_PROVIDER", "console").lower()
 EMAIL_FROM = os.getenv("EMAIL_FROM", "Quintal AI <onboarding@resend.dev>")
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "")
+
+# Resend
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+
+# SMTP
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() in ("1", "true", "yes")
+SMTP_USE_SSL = os.getenv("SMTP_USE_SSL", "false").lower() in ("1", "true", "yes")
+
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://d2pk46epz4i9kd.cloudfront.net").rstrip("/")
 
 
@@ -148,9 +173,77 @@ async def send_email(
                        error=str(exc), metadata=metadata)
             return {"ok": False, "error": str(exc)}
 
+    if EMAIL_PROVIDER == "smtp":
+        # Generic SMTP (Gmail App Password, AWS SES SMTP, Mailgun SMTP, ...).
+        # smtplib is synchronous; offload to the DB threadpool so we don't
+        # block the FastAPI event loop on slow remote SMTP servers.
+        from async_io import run_db
+
+        try:
+            await run_db(
+                _smtp_send_blocking,
+                to=to,
+                subject=subject,
+                html=html,
+                text=text,
+            )
+            latency_ms = int((time.monotonic() - started) * 1000)
+            logger.info(
+                "email_sent",
+                extra={**log_payload, "provider": "smtp", "latency_ms": latency_ms},
+            )
+            _log_to_db("sent", provider="smtp", latency_ms=latency_ms,
+                       to=to, subject=subject, template=template, error=None,
+                       metadata=metadata)
+            return {"ok": True, "id": None}
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            err = str(exc)
+            logger.warning(
+                "email_send_failed",
+                extra={**log_payload, "provider": "smtp",
+                       "latency_ms": latency_ms, "error": err[:300]},
+            )
+            _log_to_db("failed", provider="smtp", latency_ms=latency_ms,
+                       to=to, subject=subject, template=template, error=err,
+                       metadata=metadata)
+            return {"ok": False, "error": err}
+
     msg = f"Unknown EMAIL_PROVIDER={EMAIL_PROVIDER}"
     logger.error(msg)
     return {"ok": False, "error": msg}
+
+
+def _smtp_send_blocking(*, to: str, subject: str, html: str, text: str) -> None:
+    """Synchronous SMTP send. Runs inside an executor thread.
+
+    Raises on any failure so the caller writes a ``failed`` email_log row.
+    """
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD:
+        raise RuntimeError("SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD must be set.")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to
+    if EMAIL_REPLY_TO:
+        msg["Reply-To"] = EMAIL_REPLY_TO
+    msg.set_content(text)
+    msg.add_alternative(html, subtype="html")
+
+    context = ssl.create_default_context()
+    if SMTP_USE_SSL:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=15) as smtp:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            smtp.ehlo()
+            if SMTP_USE_TLS:
+                smtp.starttls(context=context)
+                smtp.ehlo()
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(msg)
 
 
 def _log_to_db(
@@ -189,4 +282,6 @@ def is_configured() -> bool:
         return True
     if EMAIL_PROVIDER == "resend":
         return bool(RESEND_API_KEY)
+    if EMAIL_PROVIDER == "smtp":
+        return bool(SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD)
     return False
