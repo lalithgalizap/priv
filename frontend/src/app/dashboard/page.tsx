@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Users, Wallet, Activity, Loader2, Crown, Building2, User } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+import { authedFetch } from "@/lib/auth";
 import AppShell from "@/components/AppShell";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 
@@ -69,19 +69,14 @@ export default function DashboardPage() {
       setError("");
       setLoading(true);
       try {
-        const { data: sesh } = await supabase.auth.getSession();
-        const t = sesh.session?.access_token;
-        if (!t || cancelled) { if (!cancelled) setLoading(false); return; }
-
-        const res = await fetch("/api/dashboard/summary", {
-          headers: { Authorization: `Bearer ${t}` },
-        });
-        if (cancelled) return;
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body.error || "Failed to load dashboard.");
-        }
-        const data = await res.json();
+        const data = await authedFetch<{
+          personal?: PersonalUsage;
+          my_quota?: typeof myQuota;
+          org?: OrgUsage;
+          org_quota?: typeof orgQuota;
+          companies?: typeof companies;
+          global_usage?: GlobalUsage;
+        }>("/api/dashboard/summary");
         if (cancelled) return;
         setPersonal(data.personal ?? null);
         setMyQuota(data.my_quota ?? null);

@@ -1,19 +1,19 @@
-import { NextRequest, NextResponse } from "next/server";
+import { dispatchEnvelope } from "@/lib/envelope";
+import { callBackend } from "@/lib/backend";
 
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
-
-export async function GET(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const token = searchParams.get("token");
-    if (!token) return NextResponse.json({ error: "Missing token." }, { status: 400 });
-    const res = await fetch(`${BACKEND_URL}/api/v1/invite/validate?token=${encodeURIComponent(token)}`);
-    if (!res.ok) {
-      const text = await res.text();
-      return NextResponse.json({ error: text.slice(0, 200) }, { status: res.status });
-    }
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ error: "Service unavailable." }, { status: 500 });
-  }
+interface ValidateBody {
+  token?: string;
 }
+
+export const POST = dispatchEnvelope({
+  POST: async (ctx) => {
+    const body = (ctx.body || {}) as ValidateBody;
+    if (!body.token) ctx.fail(400, "Missing token.");
+    const res = await callBackend({
+      path: `/api/v1/invite/validate`,
+      query: { token: body.token },
+    });
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+});

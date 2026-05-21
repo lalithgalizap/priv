@@ -1,24 +1,19 @@
-import { NextRequest, NextResponse } from "next/server";
+import { dispatchEnvelope } from "@/lib/envelope";
+import { callBackend } from "@/lib/backend";
+import { NextRequest } from "next/server";
 
-export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params;
-  const token = request.headers.get("authorization") || "";
-  if (!token) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const backendUrl = process.env.BACKEND_URL || "http://127.0.0.1:8000";
-  const { searchParams } = new URL(request.url);
-  const limit = searchParams.get("limit") || "50";
-  const offset = searchParams.get("offset") || "0";
-
-  try {
-    const res = await fetch(`${backendUrl}/api/v1/admin/tenants/${id}/ledger?limit=${limit}&offset=${offset}`, {
-      headers: { Authorization: token },
+export const POST = dispatchEnvelope<{ id: string }>({
+  GET: async (ctx, params) => {
+    if (!ctx.authHeader) ctx.fail(401, "Unauthorized");
+    const url = new URL((ctx.request as NextRequest).url);
+    const limit = url.searchParams.get("limit") || "50";
+    const offset = url.searchParams.get("offset") || "0";
+    const res = await callBackend({
+      path: `/api/v1/admin/tenants/${encodeURIComponent(params.id)}/ledger`,
+      authHeader: ctx.authHeader,
+      query: { limit, offset },
     });
-    const data = await res.json();
-    return NextResponse.json(data, { status: res.status });
-  } catch {
-    return NextResponse.json({ error: "Failed to load ledger" }, { status: 500 });
-  }
-}
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+});

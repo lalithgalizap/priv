@@ -20,7 +20,8 @@ import {
   CreditCard,
   Receipt,
 } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+import { authedFetch } from "@/lib/auth";
+import { toast } from "@/lib/toast";
 import AppShell from "@/components/AppShell";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 
@@ -87,10 +88,9 @@ export default function OrgPage() {
   const role = user?.role ?? null;
   const isLeader = role === "leader";
 
-  async function refreshQuotas(t: string) {
-    const quotaRes = await fetch("/api/org/quota", { headers: { Authorization: `Bearer ${t}` } });
-    if (quotaRes.ok) {
-      const q = await quotaRes.json();
+  async function refreshQuotas() {
+    try {
+      const q = await authedFetch<{ org?: { extra_pool: number; auto_pool_draw: boolean }; members?: { supabase_auth_id: string; quota: { daily_budget: number; daily_used: number; daily_remaining: number; extra_allocated: number; extra_used: number; extra_remaining: number; total_available: number } }[] }>("/api/org/quota");
       setOrgExtraPool(q.org?.extra_pool || 0);
       setAutoPoolDraw(q.org?.auto_pool_draw || false);
       const qmap: Record<string, { daily_budget: number; daily_used: number; daily_remaining: number; extra_allocated: number; extra_used: number; extra_remaining: number; total_available: number }> = {};
@@ -98,48 +98,34 @@ export default function OrgPage() {
         qmap[m.supabase_auth_id] = m.quota;
       }
       setMemberQuotas(qmap);
+    } catch (err) {
+      console.warn("Failed to refresh quotas:", err);
     }
   }
 
   async function fetchOrgData(role: string | null) {
     setError("");
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) {
-        setError("Not authenticated.");
-        setLoading(false);
-        return;
-      }
-
       const memberParams = new URLSearchParams({ limit: "25", offset: String(memberPage * 25) });
       if (memberSearch) memberParams.set("search", memberSearch);
 
-      const [membersRes, usageRes] = await Promise.all([
-        fetch(`/api/org?${memberParams}`, { headers: { Authorization: `Bearer ${t}` } }),
-        fetch("/api/org/usage", { headers: { Authorization: `Bearer ${t}` } }),
+      const [m, u] = await Promise.all([
+        authedFetch<{ members?: OrgMember[]; total?: number }>(`/api/org?${memberParams}`).catch(() => ({} as { members?: OrgMember[]; total?: number })),
+        authedFetch<OrgUsage>("/api/org/usage").catch(() => null),
       ]);
 
-      if (membersRes.ok) {
-        const m = await membersRes.json();
-        setMembers(m.members || []);
-        setMemberTotal(m.total || 0);
-      }
+      setMembers(m.members || []);
+      setMemberTotal(m.total || 0);
+      if (u) setUsage(u);
 
-      if (usageRes.ok) {
-        const u = await usageRes.json();
-        setUsage(u);
-      }
+      await refreshQuotas();
 
-      // Fetch quotas
-      await refreshQuotas(t);
-
-      // Fetch invites only if leader
       if (role === "leader") {
-        const invitesRes = await fetch("/api/org/invites", { headers: { Authorization: `Bearer ${t}` } });
-        if (invitesRes.ok) {
-          const inv = await invitesRes.json();
+        try {
+          const inv = await authedFetch<{ invites?: OrgInvite[] }>("/api/org/invites");
           setInvites(inv.invites || []);
+        } catch (err) {
+          console.warn("Failed to load invites:", err);
         }
       }
     } catch {
@@ -154,9 +140,6 @@ export default function OrgPage() {
     if (!amount || amount <= 0) { setError("Enter a valid amount."); return; }
     setTopUpSubmitting(true);
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) return;
       const payload = {
         amount,
         note: topUpForm.note || undefined,
@@ -168,19 +151,12 @@ export default function OrgPage() {
           cvc: topUpForm.cvc || "000",
         },
       };
-      const res = await fetch(`/api/org/topup`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        setError(data.detail || data.error || "Failed to complete top-up");
-      } else {
-        setTopUpOpen(false);
-        setTopUpForm({ ...topUpForm, amount: "", note: "" });
-        refreshQuotas(t);
-      }
+      await authedFetch(`/api/org/topup`, { method: "POST", body: payload });
+      setTopUpOpen(false);
+      setTopUpForm({ ...topUpForm, amount: "", note: "" });
+      refreshQuotas();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to complete top-up");
     } finally {
       setTopUpSubmitting(false);
     }
@@ -205,16 +181,14 @@ export default function OrgPage() {
   useEffect(() => {
     if (!mounted || userLoading || !user) return;
     async function refetchMembers() {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) return;
       const params = new URLSearchParams({ limit: "25", offset: String(memberPage * 25) });
       if (memberSearch) params.set("search", memberSearch);
-      const res = await fetch(`/api/org?${params}`, { headers: { Authorization: `Bearer ${t}` } });
-      if (res.ok) {
-        const m = await res.json();
+      try {
+        const m = await authedFetch<{ members?: OrgMember[]; total?: number }>(`/api/org?${params}`);
         setMembers(m.members || []);
         setMemberTotal(m.total || 0);
+      } catch (err) {
+        console.warn("Failed to refetch members:", err);
       }
     }
     refetchMembers();
@@ -226,32 +200,22 @@ export default function OrgPage() {
     setInviteLoading(true);
     setInviteError("");
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) return;
-      const res = await fetch("/api/org/invite", {
+      const data = await authedFetch<{ token: string }>("/api/org/invite", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
-        body: JSON.stringify({ email: inviteEmail.trim(), role: inviteRole }),
+        body: { email: inviteEmail.trim(), role: inviteRole },
       });
-      if (!res.ok) {
-        const err = await res.json();
-        setInviteError(err.error || "Failed to send invite.");
-        return;
-      }
-      const data = await res.json();
       const link = `${window.location.origin}/join?token=${data.token}`;
       setGeneratedLink(link);
       setInviteEmail("");
       setInviteRole("member");
-      // Refresh invites
-      const invRes = await fetch("/api/org/invites", { headers: { Authorization: `Bearer ${t}` } });
-      if (invRes.ok) {
-        const inv = await invRes.json();
+      try {
+        const inv = await authedFetch<{ invites?: OrgInvite[] }>("/api/org/invites");
         setInvites(inv.invites || []);
+      } catch (err) {
+        console.warn("Failed to refresh invites:", err);
       }
-    } catch {
-      setInviteError("Network error.");
+    } catch (err) {
+      setInviteError(err instanceof Error ? err.message : "Failed to send invite.");
     } finally {
       setInviteLoading(false);
     }
@@ -261,36 +225,20 @@ export default function OrgPage() {
     if (!isLeader) return;
     if (!confirm("Remove this member from the organization?")) return;
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) return;
-      const res = await fetch(`/api/org?id=${encodeURIComponent(profileId)}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${t}` },
-      });
-      if (res.ok) {
-        setMembers((prev) => prev.filter((m) => m.id !== profileId));
-      }
-    } catch {
-      /* ignore */
+      await authedFetch(`/api/org?id=${encodeURIComponent(profileId)}`, { method: "DELETE" });
+      setMembers((prev) => prev.filter((m) => m.id !== profileId));
+    } catch (err) {
+      toast.error("Couldn't remove member", err);
     }
   }
 
   async function handleRevokeInvite(inviteId: string) {
     if (!isLeader) return;
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) return;
-      const res = await fetch(`/api/org/invites?id=${encodeURIComponent(inviteId)}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${t}` },
-      });
-      if (res.ok) {
-        setInvites((prev) => prev.filter((i) => i.id !== inviteId));
-      }
-    } catch {
-      /* ignore */
+      await authedFetch(`/api/org/invites?id=${encodeURIComponent(inviteId)}`, { method: "DELETE" });
+      setInvites((prev) => prev.filter((i) => i.id !== inviteId));
+    } catch (err) {
+      toast.error("Couldn't revoke invite", err);
     }
   }
 
@@ -364,16 +312,16 @@ export default function OrgPage() {
                   <span className="text-[10px] text-outline-variant">Auto-distribute</span>
                   <button
                     onClick={async () => {
-                      const { data: sesh } = await supabase.auth.getSession();
-                      const t = sesh.session?.access_token;
-                      if (!t) return;
                       const newVal = !autoPoolDraw;
-                      const res = await fetch("/api/org/settings", {
-                        method: "PATCH",
-                        headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
-                        body: JSON.stringify({ auto_pool_draw: newVal }),
-                      });
-                      if (res.ok) setAutoPoolDraw(newVal);
+                      try {
+                        await authedFetch("/api/org/settings", {
+                          method: "PATCH",
+                          body: { auto_pool_draw: newVal },
+                        });
+                        setAutoPoolDraw(newVal);
+                      } catch (err) {
+                        toast.error("Couldn't update setting", err);
+                      }
                     }}
                     className={`w-10 h-5 rounded-full transition-all relative ${autoPoolDraw ? "bg-secondary" : "bg-outline-variant/40"}`}
                   >
@@ -539,19 +487,14 @@ export default function OrgPage() {
                                     onClick={async () => {
                                       const amount = parseInt(allocateInput, 10);
                                       if (!amount || amount <= 0) { setAllocatingMember(null); return; }
-                                      const { data: sesh } = await supabase.auth.getSession();
-                                      const tok = sesh.session?.access_token;
-                                      if (!tok) return;
-                                      const res = await fetch(`/api/org/members/${m.supabase_auth_id}/extra-tokens`, {
-                                        method: "POST",
-                                        headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
-                                        body: JSON.stringify({ amount }),
-                                      });
-                                      if (res.ok) {
-                                        await refreshQuotas(tok);
-                                      } else {
-                                        const errData = await res.json().catch(() => ({}));
-                                        setError(errData.detail || "Failed to allocate.");
+                                      try {
+                                        await authedFetch(`/api/org/members/${m.supabase_auth_id}/extra-tokens`, {
+                                          method: "POST",
+                                          body: { amount },
+                                        });
+                                        await refreshQuotas();
+                                      } catch (err) {
+                                        setError(err instanceof Error ? err.message : "Failed to allocate.");
                                       }
                                       setAllocatingMember(null);
                                       setAllocateInput("");

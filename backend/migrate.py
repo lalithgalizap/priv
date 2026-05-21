@@ -226,6 +226,31 @@ MIGRATIONS = [
     ALTER TABLE tenants
     RENAME COLUMN token_baseline TO paid_credit_used;
     """,
+    # ── model_pricing: superadmin-editable rates per 1k tokens ──
+    """
+    CREATE TABLE IF NOT EXISTS model_pricing (
+        model_identifier VARCHAR(150) PRIMARY KEY,
+        input_credits INTEGER NOT NULL CHECK (input_credits >= 0),
+        output_credits INTEGER NOT NULL CHECK (output_credits >= 0),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    # Seed defaults if the table is empty.
+    """
+    INSERT INTO model_pricing (model_identifier, input_credits, output_credits) VALUES
+        ('gpt-4o-mini', 2, 6),
+        ('gpt-4o', 25, 100),
+        ('anthropic.claude-3-sonnet-20240229-v1:0', 30, 150),
+        ('claude-3-5-sonnet', 30, 150),
+        ('anthropic.claude-3-haiku-20240307-v1:0', 4, 15),
+        ('anthropic.claude-3-opus-20240229-v1:0', 150, 750),
+        ('claude-3-opus', 150, 750),
+        ('meta.llama3-70b-instruct-v1:0', 10, 30),
+        ('mistral.mistral-large-2402-v1:0', 20, 60),
+        ('amazon.titan-text-premier-v1:0', 4, 12),
+        ('moonshotai.kimi-k2.5', 8, 24)
+    ON CONFLICT (model_identifier) DO NOTHING;
+    """,
 ]
 
 

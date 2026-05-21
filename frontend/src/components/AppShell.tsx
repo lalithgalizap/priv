@@ -16,7 +16,8 @@ import {
   Sun,
   Moon,
 } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+import { logout } from "@/lib/auth";
+import { toast } from "@/lib/toast";
 import { useRouter } from "next/navigation";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 
@@ -76,8 +77,11 @@ export default function AppShell({ children }: AppShellProps) {
   }, [isLeader, isSuperadmin]);
 
   async function handleLogout() {
-    await supabase.auth.signOut();
-    document.cookie = "sb-access-token=; path=/; max-age=0";
+    try {
+      await logout();
+    } catch (err) {
+      toast.error("Sign-out failed", err);
+    }
     window.location.href = "/login";
   }
 

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, Building2, Users, Activity, Loader2, Crown, BarChart3, Filter, Search, TrendingUp } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+import { authedFetch } from "@/lib/auth";
 import AppShell from "@/components/AppShell";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 
@@ -69,17 +69,15 @@ export default function CompanyDetailPage() {
   async function fetchCompany() {
     setError("");
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) { router.push("/login"); return; }
-      const res = await fetch(`/api/admin/companies/${id}`, { headers: { Authorization: `Bearer ${t}` } });
-      if (!res.ok) throw new Error("Failed to load company data.");
-      const data = await res.json();
+      const data = await authedFetch<CompanyDetail>(`/api/admin/companies/${id}`);
       setCompany(data);
-      // Fetch ledger
       setLedgerLoading(true);
-      const ledgerRes = await fetch(`/api/admin/companies/${data.tenant.id}/ledger`, { headers: { Authorization: `Bearer ${t}` } });
-      if (ledgerRes.ok) { const ld = await ledgerRes.json(); setLedgerEntries(ld.entries || []); }
+      try {
+        const ld = await authedFetch<{ entries?: LedgerEntry[] }>(`/api/admin/companies/${data.tenant.id}/ledger`);
+        setLedgerEntries(ld.entries || []);
+      } catch (err) {
+        console.warn("Failed to load credit ledger:", err);
+      }
       setLedgerLoading(false);
     } catch (err) { setError(err instanceof Error ? err.message : "Failed to load."); }
     finally { setLoading(false); }

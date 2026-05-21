@@ -3,20 +3,21 @@
 import { useState, useEffect } from "react";
 import { User, Key, Cpu, Save, Check, Loader2 } from "lucide-react";
 import AppShell from "@/components/AppShell";
-import { supabase } from "@/lib/supabase";
+import { authedFetch, changePassword, getCachedUser } from "@/lib/auth";
+import { toast } from "@/lib/toast";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
 
-export default function SettingsPage() {
-  const { user, token, loading: userLoading } = useCurrentUser();
+const PREFS_BROADCAST_CHANNEL = "quintal:prefs";
 
-  // AI Preferences (from DB)
+export default function SettingsPage() {
+  const { user, loading: userLoading } = useCurrentUser();
+
   const [preferredModel, setPreferredModel] = useState("moonshotai.kimi-k2.5");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState(1024);
   const [prefsLoading, setPrefsLoading] = useState(true);
   const [saved, setSaved] = useState(false);
 
-  // Password reset
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -24,42 +25,45 @@ export default function SettingsPage() {
   const [pwError, setPwError] = useState("");
   const [pwSuccess, setPwSuccess] = useState(false);
 
-  const [email, setEmail] = useState("");
+  const email = (user?.email as string) || getCachedUser()?.email || "";
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session?.user?.email) setEmail(data.session.user.email);
-    });
-  }, []);
-
-  // Load preferences from DB
-  useEffect(() => {
-    if (!token) return;
     async function load() {
       try {
-        const res = await fetch("/api/me/preferences", { headers: { Authorization: `Bearer ${token}` } });
-        if (res.ok) {
-          const data = await res.json();
-          setPreferredModel(data.preferred_model || "moonshotai.kimi-k2.5");
-          setSystemPrompt(data.system_prompt || "");
-          setMaxTokens(data.max_tokens || 1024);
-        }
-      } catch { /* ignore */ }
+        const data = await authedFetch<{ preferred_model?: string; system_prompt?: string; max_tokens?: number }>("/api/me/preferences");
+        setPreferredModel(data.preferred_model || "moonshotai.kimi-k2.5");
+        setSystemPrompt(data.system_prompt || "");
+        setMaxTokens(data.max_tokens || 1024);
+      } catch (err) {
+        toast.error("Couldn't load preferences", err);
+      }
       finally { setPrefsLoading(false); }
     }
     load();
-  }, [token]);
+  }, []);
 
   async function handleSavePreferences() {
-    if (!token) return;
     try {
-      const res = await fetch("/api/me/preferences", {
+      await authedFetch("/api/me/preferences", {
         method: "PATCH",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ preferred_model: preferredModel, system_prompt: systemPrompt, max_tokens: maxTokens }),
+        body: { preferred_model: preferredModel, system_prompt: systemPrompt, max_tokens: maxTokens },
       });
-      if (res.ok) { setSaved(true); setTimeout(() => setSaved(false), 2000); }
-    } catch { /* ignore */ }
+      // Notify other tabs / the console page so they can update without polling.
+      if (typeof BroadcastChannel !== "undefined") {
+        const ch = new BroadcastChannel(PREFS_BROADCAST_CHANNEL);
+        ch.postMessage({
+          type: "preferences-updated",
+          preferred_model: preferredModel,
+          system_prompt: systemPrompt,
+          max_tokens: maxTokens,
+        });
+        ch.close();
+      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      toast.error("Couldn't save preferences", err);
+    }
   }
 
   async function handlePasswordReset(e: React.FormEvent) {
@@ -69,13 +73,16 @@ export default function SettingsPage() {
     if (newPassword !== confirmPassword) { setPwError("Passwords do not match."); return; }
     setPwLoading(true);
     try {
-      const { error: signInError } = await supabase.auth.signInWithPassword({ email, password: currentPassword });
-      if (signInError) { setPwError("Current password is incorrect."); setPwLoading(false); return; }
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
-      if (error) { setPwError(error.message); }
-      else { setPwSuccess(true); setCurrentPassword(""); setNewPassword(""); setConfirmPassword(""); }
-    } catch { setPwError("Failed to update password."); }
-    finally { setPwLoading(false); }
+      await changePassword(currentPassword, newPassword);
+      setPwSuccess(true);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      setPwError(err instanceof Error ? err.message : "Failed to update password.");
+    } finally {
+      setPwLoading(false);
+    }
   }
 
   const roleName = user?.is_platform_admin ? "Platform Admin" : user?.role === "leader" ? "Organization Leader" : "Member";
@@ -92,7 +99,6 @@ export default function SettingsPage() {
           <p className="text-sm text-on-surface-variant">Manage your profile, security, and AI preferences.</p>
         </div>
 
-        {/* Profile Info */}
         <div className="bg-surface-container/40 border border-outline-variant/20 rounded-xl p-6">
           <h3 className="text-sm font-semibold text-on-surface mb-4 flex items-center gap-2">
             <User className="w-4 h-4 text-primary" /> Profile
@@ -109,7 +115,6 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        {/* Password Reset */}
         <div className="bg-surface-container/40 border border-outline-variant/20 rounded-xl p-6">
           <h3 className="text-sm font-semibold text-on-surface mb-4 flex items-center gap-2">
             <Key className="w-4 h-4 text-primary" /> Change Password
@@ -139,7 +144,6 @@ export default function SettingsPage() {
           </form>
         </div>
 
-        {/* AI Preferences */}
         <div className="bg-surface-container/40 border border-outline-variant/20 rounded-xl p-6">
           <h3 className="text-sm font-semibold text-on-surface mb-4 flex items-center gap-2">
             <Cpu className="w-4 h-4 text-primary" /> AI Preferences

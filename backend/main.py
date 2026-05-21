@@ -20,7 +20,6 @@ load_dotenv()
 
 from middleware.auth import get_current_user, UserSession, require_leader, require_member, require_superadmin
 import db
-import transport
 
 # Production logging
 logging.basicConfig(
@@ -144,17 +143,45 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_BEDROCK_MODEL = os.getenv("AWS_BEDROCK_MODEL", "moonshotai.kimi-k2.5")
 
-# AWS Bedrock client (lazy init)
+# Environment / mock-mode flag — refuse to start in production with no creds
+# unless ENABLE_MOCK_MODE is explicitly set.
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
+ENABLE_MOCK_MODE = os.getenv("ENABLE_MOCK_MODE", "").lower() in ("1", "true", "yes")
+HAS_AWS_BEDROCK = bool(
+    AWS_ACCESS_KEY_ID
+    and AWS_SECRET_ACCESS_KEY
+    and AWS_ACCESS_KEY_ID != "your-aws-access-key"
+)
+
+if ENVIRONMENT in ("production", "prod") and not HAS_AWS_BEDROCK and not ENABLE_MOCK_MODE:
+    raise RuntimeError(
+        "Refusing to start: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are required in "
+        "production. Set ENABLE_MOCK_MODE=true to override (NOT recommended)."
+    )
+
+# AWS Bedrock client with adaptive retries (lets boto3 backoff smarter than us)
 _bedrock_client = None
+
 
 def get_bedrock_client():
     global _bedrock_client
-    if _bedrock_client is None and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    if _bedrock_client is None and HAS_AWS_BEDROCK:
+        from botocore.config import Config
+
         _bedrock_client = boto3.client(
             "bedrock-runtime",
             region_name=AWS_REGION,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            config=Config(
+                retries={"mode": "adaptive", "max_attempts": 5},
+                connect_timeout=5,
+                read_timeout=60,
+                # Boto3 keeps a connection pool per client. Bumping this
+                # avoids serialising concurrent requests when many users
+                # are mediating at once.
+                max_pool_connections=int(os.getenv("BEDROCK_POOL_SIZE", "50")),
+            ),
         )
     return _bedrock_client
 
@@ -183,17 +210,39 @@ class MediationResponse(BaseModel):
 @app.get("/health")
 @limiter.limit("60/minute")
 async def health_check(request: Request):
-    """Liveness + readiness probe."""
+    """Liveness + readiness probe.
+
+    Reports DB connectivity, AI provider status, and clock drift relative to
+    a public NTP-synced HTTP server. Anything > 5s drift suggests NTP is not
+    syncing on the host and JWT verification will start failing.
+    """
     db_ok = False
     try:
         db.get_pool()
         db_ok = True
     except Exception:
         pass
+
+    clock_drift_ms: int | None = None
+    try:
+        # Cheap HEAD request to a global public endpoint. The Date header is
+        # populated by the server's NTP-synced clock.
+        import urllib.request
+        req = urllib.request.Request("https://www.google.com", method="HEAD")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            from email.utils import parsedate_to_datetime
+            server_time = parsedate_to_datetime(resp.headers.get("Date", "")).timestamp()
+            clock_drift_ms = int((time.time() - server_time) * 1000)
+    except Exception:
+        clock_drift_ms = None
+
     return {
         "status": "online",
         "service": "Anonymizer Core Mediation Layer",
         "database": "connected" if db_ok else "unavailable",
+        "ai_provider": "configured" if HAS_AWS_BEDROCK else ("mock" if ENABLE_MOCK_MODE else "missing"),
+        "environment": ENVIRONMENT,
+        "clock_drift_ms": clock_drift_ms,
         "version": "1.0.0",
     }
 
@@ -246,8 +295,7 @@ async def _run_ai_mediation(
     """Core mediation logic shared by JSON and multipart endpoints."""
     start_time = time.time()
 
-    # Forward to AWS Bedrock
-    has_aws = AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and AWS_ACCESS_KEY_ID != "your-aws-access-key"
+    has_aws = HAS_AWS_BEDROCK
 
     ai_response = ""
     in_tokens = 0
@@ -262,7 +310,6 @@ async def _run_ai_mediation(
         "Always wrap code in fenced code blocks with the correct language identifier."
     )
     effective_system = system_prompt.strip() if system_prompt else default_system
-    logger.info("System prompt: %s", effective_system[:100])
     messages = [{"role": "system", "content": effective_system}]
     if history:
         for msg in history[-10:]:
@@ -271,14 +318,18 @@ async def _run_ai_mediation(
     messages.append({"role": "user", "content": prompt})
 
     if not has_aws:
+        if not ENABLE_MOCK_MODE:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI provider is not configured.",
+            )
         in_tokens = sum(len(m["content"].split()) for m in messages)
         out_tokens = 128
         tot_tokens = in_tokens + out_tokens
         await asyncio.sleep(0.3)
         ai_response = (
-            f"[MOCK RESPONSE] Received prompt:\n\n"
-            f"{prompt[:200]}{'...' if len(prompt) > 200 else ''}\n\n"
-            f"[No AWS Bedrock credentials configured. This is a mock response for testing.]"
+            "[MOCK RESPONSE] AI provider not configured. "
+            "Set AWS Bedrock credentials to enable real responses."
         )
     else:
         client = get_bedrock_client()
@@ -295,7 +346,6 @@ async def _run_ai_mediation(
         }
 
         # ── Atomic credit reservation ──
-        # Estimate cost and reserve credits in a single atomic transaction
         estimated_input = len(prompt) // 4 + 1
         estimated_credits = db.estimate_request_credits(
             model_id,
@@ -315,27 +365,21 @@ async def _run_ai_mediation(
             )
 
         try:
-            # Retry with exponential backoff on throttling
-            response = None
-            for attempt in range(3):
-                try:
-                    response = client.invoke_model(
-                        modelId=model_id,
-                        body=json.dumps(body),
-                        contentType="application/json",
-                        accept="application/json",
-                    )
-                    break
-                except ClientError as e:
-                    error_code = e.response.get("Error", {}).get("Code", "")
-                    if error_code in ("ThrottlingException", "TooManyRequestsException") and attempt < 2:
-                        wait = (2 ** attempt) + 0.5
-                        logger.warning("Bedrock throttled (attempt %d/3), retrying in %.1fs", attempt + 1, wait)
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
+            # boto3 is synchronous; running it directly in an async handler
+            # blocks the event loop and serialises every concurrent user.
+            # Offload to FastAPI's threadpool so the loop stays free.
+            # Adaptive retries are configured on the client itself.
+            def _invoke():
+                return client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(body),
+                    contentType="application/json",
+                    accept="application/json",
+                )
 
-            response_body = json.loads(response["body"].read().decode("utf-8"))
+            response = await asyncio.get_event_loop().run_in_executor(None, _invoke)
+            raw = response["body"].read()
+            response_body = json.loads(raw.decode("utf-8"))
 
             # Robust response parsing
             ai_response = ""
@@ -360,7 +404,6 @@ async def _run_ai_mediation(
             out_tokens = usage.get("output_tokens", usage.get("completion_tokens", 128))
             tot_tokens = usage.get("total_tokens", in_tokens + out_tokens)
         except ClientError as e:
-            # Release reserved credits on upstream failure
             db.release_reserved_credits(
                 current_user.user_id,
                 reservation["reserved_credits"],
@@ -370,13 +413,22 @@ async def _run_ai_mediation(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Upstream AI provider error.",
             )
+        except Exception as e:
+            db.release_reserved_credits(
+                current_user.user_id,
+                reservation["reserved_credits"],
+            )
+            logger.exception("Mediation crashed: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Mediation failed.",
+            )
 
     duration = int((time.time() - start_time) * 1000)
 
     # Finalize credit consumption
     actual_credits = db.calculate_request_credits(model or AWS_BEDROCK_MODEL, in_tokens, out_tokens)
     if has_aws and not current_user.is_platform_admin:
-        # Settle: deduct actual, release any over-reservation
         db.settle_credits(
             current_user.user_id,
             current_user.tenant_id,
@@ -384,11 +436,12 @@ async def _run_ai_mediation(
             actual=actual_credits,
         )
     elif not has_aws and not current_user.is_platform_admin:
-        # Mock mode: just consume directly (no reservation was made)
+        # Dev-only mock-mode consumption. Catch only the expected ValueError;
+        # anything else should surface so we can fix it.
         try:
             db.consume_user_credits(current_user.user_id, current_user.tenant_id, actual_credits)
-        except (ValueError, Exception):
-            pass  # Mock mode, don't block
+        except ValueError as ve:
+            logger.info("Mock-mode quota exhausted for user=%s: %s", current_user.user_id, ve)
 
     # Log telemetry
     db.save_usage_metric(
@@ -412,8 +465,8 @@ async def _run_ai_mediation(
     )
 
     return MediationResponse(
-        prompt_preview=transport.encode_payload(prompt[:100]),
-        ai_response=transport.encode_payload(ai_response),
+        prompt_preview=prompt[:100],
+        ai_response=ai_response,
         tokens_processed=tot_tokens,
         model=model,
         duration_ms=duration,
@@ -428,16 +481,13 @@ async def execute_anonymous_brokerage(
     current_user: UserSession = Depends(get_current_user),
 ):
     """Text-only mediation endpoint."""
-    # Decode transport-encoded fields
-    decoded_prompt = transport.decode_payload(payload.prompt)
-    decoded_system = transport.decode_payload(payload.system_prompt) if payload.system_prompt else None
-    history = [{"role": msg.role, "content": transport.decode_payload(msg.content)} for msg in payload.history]
+    history = [{"role": msg.role, "content": msg.content} for msg in payload.history]
     return await _run_ai_mediation(
-        decoded_prompt,
+        payload.prompt,
         payload.model,
         current_user,
         history=history,
-        system_prompt=decoded_system,
+        system_prompt=payload.system_prompt,
         max_tokens=payload.max_tokens,
     )
 
@@ -455,10 +505,7 @@ async def execute_upload_brokerage(
     current_user: UserSession = Depends(get_current_user),
 ):
     """Mediation with optional document upload (PDF, DOCX, TXT, MD)."""
-    # Decode transport-encoded fields
-    decoded_prompt = transport.decode_payload(prompt)
-    decoded_system = transport.decode_payload(system_prompt) if system_prompt else None
-    full_prompt = decoded_prompt
+    full_prompt = prompt
     if file and file.filename:
         try:
             content = await asyncio.get_event_loop().run_in_executor(None, file.file.read)
@@ -473,13 +520,15 @@ async def execute_upload_brokerage(
             None, _parse_file_bytes, content, file.filename
         )
         if doc_text:
-            full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{decoded_prompt}"
+            full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{prompt}"
             logger.info("Document uploaded: %s (%d chars)", file.filename, len(doc_text))
 
     try:
         history_list = json.loads(history)
-        # Decode transport-encoded history content
-        history_list = [{"role": m.get("role", "user"), "content": transport.decode_payload(m.get("content", ""))} for m in history_list if isinstance(m, dict)]
+        history_list = [
+            {"role": m.get("role", "user"), "content": m.get("content", "")}
+            for m in history_list if isinstance(m, dict)
+        ]
     except json.JSONDecodeError:
         history_list = []
 
@@ -488,7 +537,7 @@ async def execute_upload_brokerage(
         model,
         current_user,
         history=history_list,
-        system_prompt=decoded_system,
+        system_prompt=system_prompt,
         max_tokens=max_tokens,
     )
 
@@ -1150,6 +1199,44 @@ async def admin_global_usage(
     return usage
 
 
+# ── Model Pricing (Superadmin) ────────────────────────────────────
+
+
+class ModelPricingPayload(BaseModel):
+    model_identifier: str = Field(..., min_length=1, max_length=150)
+    input_credits: int = Field(..., ge=0, le=100000)
+    output_credits: int = Field(..., ge=0, le=100000)
+
+
+@app.get("/api/v1/admin/pricing")
+@limiter.limit("30/minute")
+async def admin_list_pricing(
+    request: Request,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """List all model pricing rows. Superadmin only."""
+    return {"pricing": db.list_model_pricing()}
+
+
+@app.put("/api/v1/admin/pricing")
+@limiter.limit("30/minute")
+async def admin_upsert_pricing(
+    request: Request,
+    payload: ModelPricingPayload,
+    current_user: UserSession = Depends(require_superadmin),
+):
+    """Create or update pricing for a model. Superadmin only."""
+    try:
+        row = db.upsert_model_pricing(
+            payload.model_identifier,
+            payload.input_credits,
+            payload.output_credits,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "updated", "pricing": row}
+
+
 # ── Chat Sessions (Authenticated, per-user) ───────────────────────
 
 class CreateSessionPayload(BaseModel):
@@ -1202,10 +1289,6 @@ async def get_session(
     session = db.get_chat_session(session_id, current_user.user_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
-    # Encode message contents for transport
-    if session.get("messages"):
-        for msg in session["messages"]:
-            msg["content"] = transport.encode_payload(msg["content"])
     return {"session": session}
 
 
@@ -1247,14 +1330,11 @@ async def add_message(
     current_user: UserSession = Depends(get_current_user),
 ):
     """Add a message to a chat session."""
-    decoded_content = transport.decode_payload(payload.content)
     msg = db.add_chat_message(
-        session_id, payload.role, decoded_content, current_user.user_id
+        session_id, payload.role, payload.content, current_user.user_id
     )
     if not msg:
         raise HTTPException(status_code=404, detail="Session not found.")
-    # Encode the response content
-    msg["content"] = transport.encode_payload(msg["content"])
     return {"message": msg}
 
 

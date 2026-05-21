@@ -1,20 +1,14 @@
-import { NextRequest, NextResponse } from "next/server";
+import { dispatchEnvelope } from "@/lib/envelope";
+import { callBackend } from "@/lib/backend";
 
-export async function GET(request: NextRequest) {
-  const token = request.headers.get("authorization") || "";
-  if (!token) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
-  const backendUrl = process.env.BACKEND_URL || "http://127.0.0.1:8000";
-
-  try {
-    const res = await fetch(`${backendUrl}/api/v1/dashboard/summary`, {
-      headers: { Authorization: token },
+export const POST = dispatchEnvelope({
+  GET: async (ctx) => {
+    if (!ctx.authHeader) ctx.fail(401, "Unauthorized");
+    const res = await callBackend({
+      path: "/api/v1/dashboard/summary",
+      authHeader: ctx.authHeader,
     });
-    const data = await res.json();
-    return NextResponse.json(data, { status: res.status });
-  } catch {
-    return NextResponse.json({ error: "Backend unavailable" }, { status: 503 });
-  }
-}
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+});

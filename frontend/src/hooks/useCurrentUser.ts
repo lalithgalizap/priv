@@ -1,10 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
+import { authedFetch, getAccessToken, getCachedToken, onAuthChange } from "@/lib/auth";
 
 interface CurrentUserResponse {
-  id: string;
+  id?: string;
+  user_id?: string;
+  email: string;
+  tenant_id: string;
   role: string;
   is_platform_admin?: boolean;
   [key: string]: unknown;
@@ -17,45 +20,36 @@ interface CurrentUserData {
 
 let cachedUser: CurrentUserResponse | null = null;
 let cachedToken: string | null = null;
-let cachedAuthId: string | null = null;
 let inflight: Promise<CurrentUserData> | null = null;
 
-// Clear cache when auth state changes (logout/login as different user)
-supabase.auth.onAuthStateChange((event, session) => {
-  const newAuthId = session?.user?.id || null;
-  if (newAuthId !== cachedAuthId) {
-    cachedUser = null;
-    cachedToken = null;
-    cachedAuthId = newAuthId;
-    inflight = null;
-  }
-});
+let _unsub: (() => void) | null = null;
+function ensureSubscribed() {
+  if (_unsub) return;
+  _unsub = onAuthChange(() => {
+    const newToken = getCachedToken();
+    if (newToken !== cachedToken) {
+      cachedUser = null;
+      cachedToken = null;
+      inflight = null;
+    }
+  });
+}
 
 async function loadCurrentUser(): Promise<CurrentUserData> {
-  const { data: sesh } = await supabase.auth.getSession();
-  const token = sesh.session?.access_token;
-  if (!token) {
-    throw new Error("Not authenticated");
-  }
-  const res = await fetch("/api/me", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) {
-    const message = await res.text().catch(() => "Failed to load user");
-    throw new Error(message);
-  }
-  const user = await res.json();
+  const token = await getAccessToken();
+  if (!token) throw new Error("Not authenticated");
+  const user = await authedFetch<CurrentUserResponse>("/api/me", { method: "GET" });
   return { user, token };
 }
 
 export function useCurrentUser() {
+  ensureSubscribed();
   const [user, setUser] = useState<CurrentUserResponse | null>(cachedUser);
   const [token, setToken] = useState<string | null>(cachedToken);
   const [loading, setLoading] = useState(!cachedUser);
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
-    // If cached user matches current auth session, use it
     if (cachedUser && cachedToken) {
       setUser(cachedUser);
       setToken(cachedToken);
@@ -95,6 +89,9 @@ export function useCurrentUser() {
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
+    cachedUser = null;
+    cachedToken = null;
+    inflight = null;
     try {
       const data = await loadCurrentUser();
       cachedUser = data.user;

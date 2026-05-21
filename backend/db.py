@@ -18,8 +18,10 @@ logger = logging.getLogger("db")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
-# Credit rates per 1K tokens (integer credits, 1 credit ≈ $0.01)
-MODEL_CREDIT_RATES = {
+# Default credit rates per 1K tokens. These seed the model_pricing table on
+# first boot. After that, prices live in the DB and superadmins can edit
+# them via the admin API without redeploys.
+_DEFAULT_MODEL_CREDIT_RATES = {
     # OpenAI models
     "gpt-4o-mini": {"input": 2, "output": 6},
     "gpt-4o": {"input": 25, "output": 100},
@@ -38,32 +40,129 @@ MODEL_CREDIT_RATES = {
     # Moonshot AI models (AWS Bedrock)
     "moonshotai.kimi-k2.5": {"input": 8, "output": 24},
 }
-DEFAULT_CREDIT_RATE = {"input": 25, "output": 100}  # fallback to mid-tier model rates
+DEFAULT_CREDIT_RATE = {"input": 25, "output": 100}  # safety net
+
+# In-process cache of pricing rows. Refreshed every PRICING_CACHE_TTL seconds
+# or whenever a superadmin updates a price via the API.
+import threading
+_pricing_cache: dict[str, dict] = {}
+_pricing_cache_loaded_at: float = 0.0
+_pricing_cache_lock = threading.Lock()
+PRICING_CACHE_TTL = 60.0
+
+
+def _load_pricing_from_db() -> dict[str, dict]:
+    """Load all rows from model_pricing into a dict. Falls back to defaults."""
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT model_identifier, input_credits, output_credits FROM model_pricing"
+                )
+                rows = cur.fetchall()
+        return {
+            r["model_identifier"]: {
+                "input": int(r["input_credits"]),
+                "output": int(r["output_credits"]),
+            }
+            for r in rows
+        }
+    except Exception as e:
+        logger.warning("Pricing load failed; using defaults: %s", e)
+        return dict(_DEFAULT_MODEL_CREDIT_RATES)
+
+
+def get_pricing() -> dict[str, dict]:
+    """Return current pricing dict, refreshing the cache if stale."""
+    import time as _time
+    global _pricing_cache, _pricing_cache_loaded_at
+    now = _time.time()
+    if _pricing_cache and (now - _pricing_cache_loaded_at) < PRICING_CACHE_TTL:
+        return _pricing_cache
+    with _pricing_cache_lock:
+        if _pricing_cache and (now - _pricing_cache_loaded_at) < PRICING_CACHE_TTL:
+            return _pricing_cache
+        _pricing_cache = _load_pricing_from_db() or dict(_DEFAULT_MODEL_CREDIT_RATES)
+        _pricing_cache_loaded_at = now
+    return _pricing_cache
+
+
+def invalidate_pricing_cache() -> None:
+    global _pricing_cache, _pricing_cache_loaded_at
+    with _pricing_cache_lock:
+        _pricing_cache = {}
+        _pricing_cache_loaded_at = 0.0
+
+
+def list_model_pricing() -> list[dict]:
+    """Return all pricing rows for the admin UI."""
+    pricing = get_pricing()
+    return [
+        {"model_identifier": mid, "input_credits": rates["input"], "output_credits": rates["output"]}
+        for mid, rates in sorted(pricing.items())
+    ]
+
+
+def upsert_model_pricing(model_identifier: str, input_credits: int, output_credits: int) -> dict:
+    """Insert or update a single pricing row. Invalidates the cache."""
+    if input_credits < 0 or output_credits < 0:
+        raise ValueError("Credit rates must be non-negative.")
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO model_pricing (model_identifier, input_credits, output_credits, updated_at)
+                VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (model_identifier) DO UPDATE SET
+                    input_credits = EXCLUDED.input_credits,
+                    output_credits = EXCLUDED.output_credits,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING model_identifier, input_credits, output_credits
+                """,
+                (model_identifier, input_credits, output_credits),
+            )
+            row = cur.fetchone()
+            conn.commit()
+    invalidate_pricing_cache()
+    return dict(row)
 
 
 def calculate_request_credits(model_identifier: str, input_tokens: int, output_tokens: int) -> int:
     """Convert actual token usage to credits based on model pricing."""
-    rates = MODEL_CREDIT_RATES.get(model_identifier, DEFAULT_CREDIT_RATE)
+    pricing = get_pricing()
+    rates = pricing.get(model_identifier, DEFAULT_CREDIT_RATE)
     input_credits = (input_tokens / 1000) * rates["input"]
     output_credits = (output_tokens / 1000) * rates["output"]
-    return max(1, int(input_credits + output_credits))  # at least 1 credit per request
+    return max(1, int(input_credits + output_credits))
 
 
 def estimate_request_credits(model_identifier: str, estimated_input_tokens: int, estimated_output_tokens: int) -> int:
     """Pre-flight estimate of request cost in credits."""
     return calculate_request_credits(model_identifier, estimated_input_tokens, estimated_output_tokens)
 
+
+# Backwards-compat alias for any external imports.
+MODEL_CREDIT_RATES = _DEFAULT_MODEL_CREDIT_RATES
+
 _pool: Optional[SimpleConnectionPool] = None
+
+DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "5"))
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "40"))
 
 
 def get_pool() -> SimpleConnectionPool:
     global _pool
     if _pool is None and DATABASE_URL:
         _pool = SimpleConnectionPool(
-            minconn=3,
-            maxconn=10,
+            minconn=DB_POOL_MIN,
+            maxconn=DB_POOL_MAX,
             dsn=DATABASE_URL,
             sslmode="require",
+            connect_timeout=5,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
     return _pool
 
@@ -130,6 +229,15 @@ def init_db():
         """,
         'CREATE INDEX IF NOT EXISTS idx_metrics_tenant_date ON tenant_usage_metrics (tenant_id, api_call_timestamp DESC)',
         'CREATE INDEX IF NOT EXISTS idx_metrics_user ON tenant_usage_metrics (supabase_auth_id)',
+        # Model pricing table — superadmin-editable rates per 1k tokens
+        """
+        CREATE TABLE IF NOT EXISTS model_pricing (
+            model_identifier VARCHAR(150) PRIMARY KEY,
+            input_credits INTEGER NOT NULL CHECK (input_credits >= 0),
+            output_credits INTEGER NOT NULL CHECK (output_credits >= 0),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
     ]
 
     with get_db() as conn:
@@ -142,6 +250,26 @@ def init_db():
                     # already exists, table already exists, index already exists).
                     logger.debug("DDL statement skipped: %s", e)
         conn.commit()
+
+    # Seed model_pricing defaults if the table is empty.
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM model_pricing")
+                if int(cur.fetchone()[0]) == 0:
+                    for mid, rates in _DEFAULT_MODEL_CREDIT_RATES.items():
+                        cur.execute(
+                            """
+                            INSERT INTO model_pricing (model_identifier, input_credits, output_credits)
+                            VALUES (%s, %s, %s)
+                            ON CONFLICT (model_identifier) DO NOTHING
+                            """,
+                            (mid, rates["input"], rates["output"]),
+                        )
+                    conn.commit()
+                    logger.info("Seeded model_pricing with %d defaults", len(_DEFAULT_MODEL_CREDIT_RATES))
+    except Exception as e:
+        logger.warning("model_pricing seed skipped: %s", e)
 
 
 def ensure_default_tenant() -> bool:
@@ -683,7 +811,7 @@ def get_user_preferences(supabase_auth_id: str) -> dict:
                 return {"preferred_model": "moonshotai.kimi-k2.5", "system_prompt": "", "max_tokens": 1024}
             return {
                 "preferred_model": row["preferred_model"] or "moonshotai.kimi-k2.5",
-                "system_prompt": encryption.decrypt(row["system_prompt"] or "", supabase_auth_id),
+                "system_prompt": encryption.safe_decrypt(row["system_prompt"] or "", supabase_auth_id, placeholder=""),
                 "max_tokens": int(row["max_tokens"] or 1024),
             }
 
@@ -710,7 +838,7 @@ def update_user_preferences(supabase_auth_id: str, updates: dict) -> dict:
                 return {"status": "not found"}
             return {
                 "preferred_model": row["preferred_model"] or "moonshotai.kimi-k2.5",
-                "system_prompt": encryption.decrypt(row["system_prompt"] or "", supabase_auth_id),
+                "system_prompt": encryption.safe_decrypt(row["system_prompt"] or "", supabase_auth_id, placeholder=""),
                 "max_tokens": int(row["max_tokens"] or 1024),
             }
 
@@ -1186,7 +1314,7 @@ def get_chat_session(session_id: str, supabase_auth_id: str) -> dict | None:
             messages = []
             for row in cur.fetchall():
                 msg = dict(row)
-                msg["content"] = encryption.decrypt(msg["content"], supabase_auth_id)
+                msg["content"] = encryption.safe_decrypt(msg["content"], supabase_auth_id)
                 messages.append(msg)
             return {**dict(session), "messages": messages}
 

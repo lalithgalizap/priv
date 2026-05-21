@@ -1,10 +1,32 @@
+"""Supabase JWT verification middleware.
+
+Validates the Bearer token against Supabase's JWKS endpoint and resolves the
+calling user's tenant + role from our DB.
+
+Hardened for production:
+- JWKS stale-cache fallback is capped at JWKS_MAX_STALE_SECONDS (default 6h);
+  after that we fail closed rather than accepting tokens we can't re-verify.
+- JWK → PEM conversion uses the `cryptography` library (already a dep) so we
+  support both EC P-256 (Supabase default) and RSA out of the box.
+- pyjwt.decode runs with a 30s leeway to tolerate small clock skew between
+  Supabase auth and this host. Larger drift is surfaced via /health.
+"""
+
 import logging
 import os
 import base64
 import json
+import re
+import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from typing import Optional
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature  # noqa: F401 (kept for type discoverability)
 
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -16,15 +38,19 @@ import db
 logger = logging.getLogger("auth")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-JWKS_CACHE_TTL_SECONDS = 1800  # 30 minutes
-
-# Cache for JWKS keys
-_jwks_cache: dict = {}
-_jwks_cache_time: float = 0.0
+JWKS_CACHE_TTL_SECONDS = 1800  # 30 min — re-fetch happily within this window
+JWKS_MAX_STALE_SECONDS = int(os.getenv("JWKS_MAX_STALE_SECONDS", "21600"))  # 6 hours hard cap
+JWT_LEEWAY_SECONDS = 30
 
 
-def _is_jwks_cache_valid() -> bool:
-    return bool(_jwks_cache) and (time.time() - _jwks_cache_time) < JWKS_CACHE_TTL_SECONDS
+@dataclass
+class _JwksState:
+    keys: dict
+    fetched_at: float
+
+
+_jwks_state: Optional[_JwksState] = None
+_jwks_lock = threading.Lock()
 
 
 def _b64url_decode(val: str) -> bytes:
@@ -34,13 +60,10 @@ def _b64url_decode(val: str) -> bytes:
     return base64.urlsafe_b64decode(val)
 
 
-def _fetch_jwks() -> dict:
-    """Fetch JWKS from Supabase well-known endpoint. Uses cached keys if still valid."""
-    global _jwks_cache, _jwks_cache_time
-    if _is_jwks_cache_valid():
-        return _jwks_cache
+def _fetch_jwks_remote() -> Optional[dict]:
+    """Attempt to fetch the JWKS document from Supabase. Returns None on failure."""
     if not SUPABASE_URL:
-        return {}
+        return None
     urls = [
         f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json",
         f"{SUPABASE_URL}/.well-known/jwks.json",
@@ -49,84 +72,109 @@ def _fetch_jwks() -> dict:
         try:
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as resp:
-                _jwks_cache = json.loads(resp.read().decode("utf-8"))
-                _jwks_cache_time = time.time()
-                logger.info("Loaded %d keys from %s", len(_jwks_cache.get("keys", [])), url)
-                return _jwks_cache
+                doc = json.loads(resp.read().decode("utf-8"))
+                logger.info("Loaded %d JWKS keys from %s", len(doc.get("keys", [])), url)
+                return doc
         except Exception as e:
             logger.warning("Failed to fetch JWKS from %s: %s", url, e)
-    # If fetch fails but we have stale cache, use it as fallback
-    if _jwks_cache:
-        logger.info("Using stale JWKS cache as fallback")
-        return _jwks_cache
-    return {}
+    return None
+
+
+def _get_jwks() -> Optional[dict]:
+    """Return the currently-trusted JWKS, refreshing if expired.
+
+    Stale cache (older than the TTL but younger than the hard max) is allowed
+    while we attempt a re-fetch; if the re-fetch fails we fall back to the
+    stale copy. Anything older than ``JWKS_MAX_STALE_SECONDS`` is discarded
+    and we fail closed.
+    """
+    global _jwks_state
+    now = time.time()
+
+    with _jwks_lock:
+        state = _jwks_state
+        if state and (now - state.fetched_at) < JWKS_CACHE_TTL_SECONDS:
+            return state.keys
+
+        # Either no cache or it's beyond the soft TTL — try a fresh fetch.
+        fresh = _fetch_jwks_remote()
+        if fresh is not None:
+            _jwks_state = _JwksState(keys=fresh, fetched_at=now)
+            return fresh
+
+        # Fresh fetch failed; only use stale cache if within the hard window.
+        if state and (now - state.fetched_at) < JWKS_MAX_STALE_SECONDS:
+            logger.warning(
+                "Using stale JWKS cache (age=%.0fs)",
+                now - state.fetched_at,
+            )
+            return state.keys
+
+        if state:
+            logger.error(
+                "JWKS cache exceeded max stale age (%ds). Rejecting tokens until refresh.",
+                JWKS_MAX_STALE_SECONDS,
+            )
+            _jwks_state = None  # Force fresh attempts every request.
+        return None
 
 
 def _is_uuid(val: str) -> bool:
-    """Check if string is a valid UUID format."""
-    import re
     return bool(re.match(
         r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-        val.lower()
+        val.lower(),
     ))
 
 
-def _jwk_to_pem(jwk: dict) -> str:
-    """Convert EC P-256 JWK to PEM public key."""
-    import base64
+def _jwk_to_pem(jwk: dict) -> Optional[str]:
+    """Convert a JWK (EC P-256 or RSA) to PEM-encoded SubjectPublicKeyInfo.
 
-    x_bytes = _b64url_decode(jwk["x"])
-    y_bytes = _b64url_decode(jwk["y"])
-
-    # Uncompressed point: 04 || x || y
-    point = b"\x04" + x_bytes + y_bytes
-
-    # Build SubjectPublicKeyInfo DER
-    # AlgorithmIdentifier for EC P-256
-    # SEQUENCE { OID ecPublicKey, OID prime256v1 }
-    alg_id = bytes([
-        0x30, 0x13,  # SEQUENCE, length 19
-        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,  # ecPublicKey
-        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,  # prime256v1
-    ])
-
-    # BIT STRING wrapping the point
-    bit_str = bytes([0x00]) + point  # unused bits = 0
-    bit_str = bytes([0x03, len(bit_str)]) + bit_str
-
-    # SubjectPublicKeyInfo
-    spki = alg_id + bit_str
-    spki = bytes([0x30, len(spki)]) + spki
-
-    b64 = base64.b64encode(spki).decode("ascii")
-    lines = ["-----BEGIN PUBLIC KEY-----"]
-    for i in range(0, len(b64), 64):
-        lines.append(b64[i:i+64])
-    lines.append("-----END PUBLIC KEY-----")
-    return "\n".join(lines)
+    Uses cryptography's ``EllipticCurvePublicNumbers`` / ``RSAPublicNumbers``
+    constructors instead of hand-rolled DER. Supports the formats Supabase has
+    historically used (EC) and may use in the future (RSA).
+    """
+    kty = jwk.get("kty")
+    try:
+        if kty == "EC" and jwk.get("crv") == "P-256":
+            x = int.from_bytes(_b64url_decode(jwk["x"]), "big")
+            y = int.from_bytes(_b64url_decode(jwk["y"]), "big")
+            pubkey = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key(default_backend())
+        elif kty == "RSA":
+            n = int.from_bytes(_b64url_decode(jwk["n"]), "big")
+            e = int.from_bytes(_b64url_decode(jwk["e"]), "big")
+            pubkey = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+        else:
+            logger.warning("Unsupported JWK kty=%s crv=%s", kty, jwk.get("crv"))
+            return None
+        pem = pubkey.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem.decode("ascii")
+    except Exception as exc:
+        logger.exception("Failed to convert JWK to PEM: %s", exc)
+        return None
 
 
 def _get_key_for_token(token: str) -> Optional[str]:
     """Get the PEM public key matching the token's kid from JWKS."""
-    jwks = _fetch_jwks()
-    keys = jwks.get("keys", [])
+    jwks = _get_jwks()
+    if not jwks:
+        return None
+    keys = jwks.get("keys") or []
     if not keys:
         return None
 
-    # Extract kid from JWT header (no verification needed)
     try:
-        header = json.loads(base64.urlsafe_b64decode(token.split(".")[0] + "=="))
+        header_part = token.split(".")[0]
+        header = json.loads(base64.urlsafe_b64decode(header_part + "==").decode("utf-8"))
     except Exception:
         header = {}
 
     token_kid = header.get("kid")
     for jwk in keys:
         if jwk.get("kid") == token_kid:
-            if jwk.get("kty") == "EC" and jwk.get("crv") == "P-256":
-                return _jwk_to_pem(jwk)
-            # If it's RSA, we could handle that too
-            if jwk.get("kty") == "RSA":
-                return None  # RSA not implemented here yet
+            return _jwk_to_pem(jwk)
     return None
 
 
@@ -139,7 +187,6 @@ class UserSession(BaseModel):
 
 
 def _resolve_role(user_id: str) -> str:
-    """Look up role from DB; fall back to member if not found."""
     try:
         return db.get_user_role(user_id)
     except Exception:
@@ -147,7 +194,6 @@ def _resolve_role(user_id: str) -> str:
 
 
 def _resolve_is_platform_admin(user_id: str) -> bool:
-    """Look up platform admin status from DB."""
     try:
         return db.is_platform_admin(user_id)
     except Exception:
@@ -155,7 +201,6 @@ def _resolve_is_platform_admin(user_id: str) -> bool:
 
 
 def _resolve_tenant_from_db(user_id: str) -> str | None:
-    """Look up tenant_id from user profile. Returns None if no profile or no tenant."""
     try:
         profile = db.ensure_user_profile(user_id, "")
         if not profile or not profile.get("tenant_id"):
@@ -171,12 +216,16 @@ def _try_api_key_auth(token: str) -> UserSession | None:
         key_data = db.validate_api_key(token)
         if not key_data:
             return None
-        tenant_id = str(key_data["tenant_id"]) if _is_uuid(str(key_data["tenant_id"])) else db.DEFAULT_TENANT_ID
+        tenant_id = (
+            str(key_data["tenant_id"])
+            if _is_uuid(str(key_data["tenant_id"]))
+            else db.DEFAULT_TENANT_ID
+        )
         return UserSession(
             user_id=f"apikey:{key_data['id']}",
             email="",
             tenant_id=tenant_id,
-            role="member",  # API keys act as member-level
+            role="member",
             is_platform_admin=False,
         )
     except Exception as e:
@@ -192,7 +241,6 @@ def get_current_user(
 ) -> UserSession:
     token = credentials.credentials
 
-    # Try API key auth first (tokens starting with ak_)
     if token.startswith("ak_"):
         api_user = _try_api_key_auth(token)
         if api_user:
@@ -202,9 +250,7 @@ def get_current_user(
             detail="Invalid API key.",
         )
 
-    # JWT auth
     key = _get_key_for_token(token)
-
     if not key:
         logger.warning("No matching JWKS key found for token")
         raise HTTPException(
@@ -218,10 +264,10 @@ def get_current_user(
             key,
             algorithms=["ES256", "RS256"],
             audience="authenticated",
+            leeway=JWT_LEEWAY_SECONDS,
         )
         user_id = payload.get("sub", "")
         email = payload.get("email", "")
-        # Resolve tenant from DB profile; fallback to JWT metadata then default
         db_tenant = _resolve_tenant_from_db(user_id)
         if db_tenant:
             tenant_id = db_tenant
@@ -256,7 +302,8 @@ def get_current_user(
         )
 
 
-# Role-based access control helpers
+# ── Role-based access control ────────────────────────────────────
+
 
 class RoleChecker:
     def __init__(self, allowed_roles: list[str]):

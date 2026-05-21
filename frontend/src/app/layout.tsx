@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Sora, JetBrains_Mono, Inter } from "next/font/google";
 import "./globals.css";
+import ToastViewport from "@/components/ToastViewport";
 
 const sora = Sora({
   variable: "--font-sora",
@@ -38,6 +39,7 @@ export default function RootLayout({
     >
       <body className={`${sora.variable} ${inter.variable} ${jetbrains.variable} min-h-screen bg-background text-on-surface font-body antialiased`}>
         {children}
+        <ToastViewport />
       </body>
     </html>
   );

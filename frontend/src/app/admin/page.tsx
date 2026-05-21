@@ -3,10 +3,11 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   Building2, Users, Plus, Trash2, Shield, Activity, Loader2,
-  AlertTriangle, Mail, Crown, Wallet, X, Copy, Check, Link,
-  Search, ChevronLeft, ChevronRight, ArrowUpDown,
+  AlertTriangle, Mail, Crown, Wallet, X, Link,
+  Search, ChevronLeft, ChevronRight,
 } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+import { authedFetch } from "@/lib/auth";
+import { toast } from "@/lib/toast";
 import AppShell from "@/components/AppShell";
 import { useRouter } from "next/navigation";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
@@ -39,7 +40,6 @@ export default function AdminPage() {
   const { user, loading: userLoading } = useCurrentUser();
   const [activeTab, setActiveTab] = useState<"companies" | "users">("companies");
 
-  // Companies state
   const [companies, setCompanies] = useState<Company[]>([]);
   const [compTotal, setCompTotal] = useState(0);
   const [compPage, setCompPage] = useState(0);
@@ -48,7 +48,6 @@ export default function AdminPage() {
   const [compSortDir, setCompSortDir] = useState("desc");
   const [compLoading, setCompLoading] = useState(true);
 
-  // Users state
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [userTotal, setUserTotal] = useState(0);
   const [userPage, setUserPage] = useState(0);
@@ -56,7 +55,6 @@ export default function AdminPage() {
   const [userRoleFilter, setUserRoleFilter] = useState("");
   const [usersLoading, setUsersLoading] = useState(true);
 
-  // Modals
   const [showCreate, setShowCreate] = useState(false);
   const [newCompanyName, setNewCompanyName] = useState("");
   const [newCompanyTier, setNewCompanyTier] = useState("standard");
@@ -65,24 +63,15 @@ export default function AdminPage() {
   const [assignEmail, setAssignEmail] = useState("");
   const [assignLoading, setAssignLoading] = useState(false);
   const [generatedLink, setGeneratedLink] = useState("");
-  const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
 
-  // Global stats
   const [globalStats, setGlobalStats] = useState({ totalCompanies: 0, totalUsers: 0, totalTokens: 0, totalCredits: 0 });
 
   const isSuperadmin = Boolean(user?.is_platform_admin || user?.role === "superadmin");
 
-  const getToken = useCallback(async () => {
-    const { data: sesh } = await supabase.auth.getSession();
-    return sesh.session?.access_token || null;
-  }, []);
-
   const fetchCompanies = useCallback(async () => {
     setCompLoading(true);
     try {
-      const t = await getToken();
-      if (!t) return;
       const params = new URLSearchParams({
         limit: String(PAGE_SIZE),
         offset: String(compPage * PAGE_SIZE),
@@ -90,36 +79,28 @@ export default function AdminPage() {
         sort_dir: compSortDir,
       });
       if (compSearch) params.set("search", compSearch);
-      const res = await fetch(`/api/admin/companies?${params}`, { headers: { Authorization: `Bearer ${t}` } });
-      if (res.ok) {
-        const data = await res.json();
-        setCompanies(data.companies || []);
-        setCompTotal(data.total || 0);
-      }
+      const data = await authedFetch<{ companies?: Company[]; total?: number }>(`/api/admin/companies?${params}`);
+      setCompanies(data.companies || []);
+      setCompTotal(data.total || 0);
     } catch { setError("Failed to load companies."); }
     finally { setCompLoading(false); }
-  }, [compPage, compSearch, compSort, compSortDir, getToken]);
+  }, [compPage, compSearch, compSort, compSortDir]);
 
   const fetchUsers = useCallback(async () => {
     setUsersLoading(true);
     try {
-      const t = await getToken();
-      if (!t) return;
       const params = new URLSearchParams({
         limit: String(PAGE_SIZE),
         offset: String(userPage * PAGE_SIZE),
       });
       if (userSearch) params.set("search", userSearch);
       if (userRoleFilter) params.set("role", userRoleFilter);
-      const res = await fetch(`/api/admin/users?${params}`, { headers: { Authorization: `Bearer ${t}` } });
-      if (res.ok) {
-        const data = await res.json();
-        setUsers(data.users || []);
-        setUserTotal(data.total || 0);
-      }
+      const data = await authedFetch<{ users?: AdminUser[]; total?: number }>(`/api/admin/users?${params}`);
+      setUsers(data.users || []);
+      setUserTotal(data.total || 0);
     } catch { setError("Failed to load users."); }
     finally { setUsersLoading(false); }
-  }, [userPage, userSearch, userRoleFilter, getToken]);
+  }, [userPage, userSearch, userRoleFilter]);
 
   useEffect(() => {
     if (userLoading) return;
@@ -130,7 +111,6 @@ export default function AdminPage() {
   useEffect(() => { if (isSuperadmin) fetchCompanies(); }, [fetchCompanies, isSuperadmin]);
   useEffect(() => { if (isSuperadmin && activeTab === "users") fetchUsers(); }, [fetchUsers, isSuperadmin, activeTab]);
 
-  // Derive global stats from companies
   useEffect(() => {
     setGlobalStats({
       totalCompanies: compTotal,
@@ -145,15 +125,17 @@ export default function AdminPage() {
     if (!newCompanyName.trim()) return;
     setCreateLoading(true);
     try {
-      const t = await getToken();
-      if (!t) return;
-      const res = await fetch("/api/admin/companies", {
+      await authedFetch("/api/admin/companies", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
-        body: JSON.stringify({ company_name: newCompanyName.trim(), tier: newCompanyTier }),
+        body: { company_name: newCompanyName.trim(), tier: newCompanyTier },
       });
-      if (res.ok) { setShowCreate(false); setNewCompanyName(""); fetchCompanies(); }
-    } finally { setCreateLoading(false); }
+      setShowCreate(false);
+      setNewCompanyName("");
+      fetchCompanies();
+    } catch (err) {
+      toast.error("Couldn't create company", err);
+    }
+    finally { setCreateLoading(false); }
   }
 
   async function handleAssignLeader(e: React.FormEvent) {
@@ -161,40 +143,43 @@ export default function AdminPage() {
     if (!assignEmail.trim() || !assignCompanyId) return;
     setAssignLoading(true);
     try {
-      const t = await getToken();
-      if (!t) return;
-      const res = await fetch(`/api/admin/companies/leader?tenantId=${encodeURIComponent(assignCompanyId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
-        body: JSON.stringify({ email: assignEmail.trim() }),
-      });
-      if (res.ok) {
-        const data = await res.json();
+      const data = await authedFetch<{ token?: string }>(
+        `/api/admin/companies/leader?tenantId=${encodeURIComponent(assignCompanyId)}`,
+        {
+          method: "POST",
+          body: { email: assignEmail.trim() },
+        }
+      );
+      if (data.token) {
         setGeneratedLink(`${window.location.origin}/join?token=${data.token}`);
         setAssignEmail("");
       }
-    } finally { setAssignLoading(false); }
+    } catch (err) {
+      toast.error("Couldn't assign leader", err);
+    }
+    finally { setAssignLoading(false); }
   }
 
   async function handleDeleteUser(userId: string) {
     if (!confirm("Permanently delete this user? This cannot be undone.")) return;
-    const t = await getToken();
-    if (!t) return;
-    const res = await fetch(`/api/admin/users?id=${encodeURIComponent(userId)}`, {
-      method: "DELETE", headers: { Authorization: `Bearer ${t}` },
-    });
-    if (res.ok) fetchUsers();
+    try {
+      await authedFetch(`/api/admin/users?id=${encodeURIComponent(userId)}`, { method: "DELETE" });
+      fetchUsers();
+    } catch (err) {
+      toast.error("Couldn't delete user", err);
+    }
   }
 
   async function handleUpdateUserRole(userId: string, newRole: string) {
-    const t = await getToken();
-    if (!t) return;
-    await fetch(`/api/admin/users?id=${encodeURIComponent(userId)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
-      body: JSON.stringify({ role: newRole }),
-    });
-    fetchUsers();
+    try {
+      await authedFetch(`/api/admin/users?id=${encodeURIComponent(userId)}`, {
+        method: "PATCH",
+        body: { role: newRole },
+      });
+      fetchUsers();
+    } catch (err) {
+      toast.error("Couldn't update role", err);
+    }
   }
 
   function toggleSort(field: string) {
@@ -213,7 +198,6 @@ export default function AdminPage() {
   return (
     <AppShell>
       <div className="max-w-7xl mx-auto px-6 py-8 space-y-6">
-        {/* Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Crown className="w-6 h-6 text-primary" />
@@ -227,7 +211,6 @@ export default function AdminPage() {
           </button>
         </div>
 
-        {/* KPI Cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {[
             { label: "Companies", value: compTotal, icon: Building2, color: "text-primary" },
@@ -252,7 +235,6 @@ export default function AdminPage() {
           </div>
         )}
 
-        {/* Tabs */}
         <div className="flex gap-1 p-1 bg-surface-container-low/50 rounded-lg border border-outline-variant/20 w-fit">
           {([["companies", "Companies", Building2], ["users", "All Users", Users]] as const).map(([key, label, Icon]) => (
             <button key={key} onClick={() => setActiveTab(key)}
@@ -263,10 +245,8 @@ export default function AdminPage() {
           ))}
         </div>
 
-        {/* Companies Tab */}
         {activeTab === "companies" && (
           <div className="glass-panel rounded-xl overflow-hidden">
-            {/* Search + Sort Bar */}
             <div className="px-6 py-4 border-b border-outline-variant/20 flex flex-col md:flex-row md:items-center gap-3">
               <div className="relative flex-1 max-w-sm">
                 <Search className="w-4 h-4 text-outline absolute left-3 top-2.5" />
@@ -284,7 +264,6 @@ export default function AdminPage() {
               </div>
             </div>
 
-            {/* Table */}
             <div className="overflow-x-auto">
               <table className="min-w-full">
                 <thead className="bg-surface-container-high/30">
@@ -326,7 +305,6 @@ export default function AdminPage() {
               </table>
             </div>
 
-            {/* Pagination */}
             {compPages > 1 && (
               <div className="px-6 py-3 border-t border-outline-variant/20 flex items-center justify-between">
                 <span className="text-xs font-mono text-outline">Page {compPage + 1} of {compPages} ({compTotal} total)</span>
@@ -339,7 +317,6 @@ export default function AdminPage() {
           </div>
         )}
 
-        {/* Users Tab */}
         {activeTab === "users" && (
           <div className="glass-panel rounded-xl overflow-hidden">
             <div className="px-6 py-4 border-b border-outline-variant/20 flex flex-col md:flex-row md:items-center gap-3">
@@ -414,7 +391,6 @@ export default function AdminPage() {
           </div>
         )}
 
-        {/* Create Company Modal */}
         {showCreate && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
             <div className="glass-panel rounded-xl w-full max-w-md p-6 space-y-4">
@@ -446,7 +422,6 @@ export default function AdminPage() {
           </div>
         )}
 
-        {/* Assign Leader Modal */}
         {assignCompanyId && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
             <div className="glass-panel rounded-xl w-full max-w-md p-6 space-y-4">

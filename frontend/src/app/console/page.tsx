@@ -3,11 +3,39 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Send, User, Bot, Loader2, Paperclip, X, Plus, Trash2, MessageSquare, PanelLeftClose, PanelLeft, AlertTriangle } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { supabase } from "@/lib/supabase";
-import { encodePayload, decodePayload } from "@/lib/transport";
+import { authedFetch } from "@/lib/auth";
+import { toast } from "@/lib/toast";
 import AppShell from "@/components/AppShell";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+
+// Pricing (credits per 1k tokens) — superadmin can update via /api/admin/pricing.
+// Used for client-side cost estimation so we don't ping the backend on every keystroke.
+const LOCAL_PRICING_FALLBACK: Record<string, { input: number; output: number }> = {
+  "moonshotai.kimi-k2.5": { input: 8, output: 24 },
+  "anthropic.claude-3-sonnet-20240229-v1:0": { input: 30, output: 150 },
+  "anthropic.claude-3-haiku-20240307-v1:0": { input: 4, output: 15 },
+  "meta.llama3-70b-instruct-v1:0": { input: 10, output: 30 },
+  "mistral.mistral-large-2402-v1:0": { input: 20, output: 60 },
+  "amazon.titan-text-premier-v1:0": { input: 4, output: 12 },
+};
+const DEFAULT_RATE = { input: 25, output: 100 };
+
+function estimateCreditsLocal(promptChars: number, model: string, maxOutputTokens: number): number {
+  const rate = LOCAL_PRICING_FALLBACK[model] || DEFAULT_RATE;
+  const inputTokens = Math.ceil(promptChars / 4);
+  const inCredits = (inputTokens / 1000) * rate.input;
+  const outCredits = (maxOutputTokens / 1000) * rate.output;
+  return Math.max(1, Math.round(inCredits + outCredits));
+}
+
+const PREFS_BROADCAST_CHANNEL = "quintal:prefs";
+type PrefsBroadcast = {
+  type: "preferences-updated";
+  preferred_model?: string;
+  system_prompt?: string;
+  max_tokens?: number;
+};
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -59,11 +87,6 @@ function createNewSession(title = "New Session", id?: string): ChatSession {
   };
 }
 
-async function getAuthToken(): Promise<string | null> {
-  const { data } = await supabase.auth.getSession();
-  return data.session?.access_token || null;
-}
-
 export default function ConsolePage() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -84,64 +107,48 @@ export default function ConsolePage() {
   const [userSystemPrompt, setUserSystemPrompt] = useState("");
   const [userMaxTokens, setUserMaxTokens] = useState(1024);
 
-  // Reload preferences when page becomes visible (e.g., after saving in Settings)
+  // Listen for preference updates broadcast from the Settings page (no polling).
   useEffect(() => {
-    const handleFocus = async () => {
-      const token = await getAuthToken();
-      if (!token) return;
-      const res = await fetch("/api/me/preferences", { headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) {
-        const prefs = await res.json();
-        if (prefs.preferred_model && MODELS.some((m) => m.id === prefs.preferred_model)) {
-          setSelectedModel(prefs.preferred_model);
-        }
-        setUserSystemPrompt(prefs.system_prompt || "");
-        setUserMaxTokens(prefs.max_tokens || 1024);
+    if (typeof BroadcastChannel === "undefined") return;
+    const ch = new BroadcastChannel(PREFS_BROADCAST_CHANNEL);
+    ch.onmessage = (event: MessageEvent<PrefsBroadcast>) => {
+      const data = event.data;
+      if (!data || data.type !== "preferences-updated") return;
+      if (data.preferred_model && MODELS.some((m) => m.id === data.preferred_model)) {
+        setSelectedModel(data.preferred_model);
       }
+      if (typeof data.system_prompt === "string") setUserSystemPrompt(data.system_prompt);
+      if (typeof data.max_tokens === "number") setUserMaxTokens(data.max_tokens);
     };
-    window.addEventListener("focus", handleFocus);
-    return () => window.removeEventListener("focus", handleFocus);
+    return () => ch.close();
   }, []);
 
-  // Load preferences + sessions on mount (single effect, with cancellation to prevent StrictMode double-call)
+  // Load preferences + sessions on mount
   useEffect(() => {
     let cancelled = false;
     async function loadFromApi() {
       try {
-        const token = await getAuthToken();
-        if (!token || cancelled) { setApiLoading(false); return; }
-
-        // Load preferences and sessions in parallel
-        const [prefsRes, sessionsRes] = await Promise.all([
-          fetch("/api/me/preferences", { headers: { Authorization: `Bearer ${token}` } }),
-          fetch("/api/sessions", { headers: { Authorization: `Bearer ${token}` } }),
+        const [prefs, sessionsResp] = await Promise.all([
+          authedFetch<{ preferred_model?: string; system_prompt?: string; max_tokens?: number }>("/api/me/preferences").catch(() => ({} as { preferred_model?: string; system_prompt?: string; max_tokens?: number })),
+          authedFetch<{ sessions?: ApiSession[] }>("/api/sessions"),
         ]);
         if (cancelled) return;
 
-        if (prefsRes.ok) {
-          const prefs = await prefsRes.json();
-          if (prefs.preferred_model && MODELS.some((m) => m.id === prefs.preferred_model)) {
-            setSelectedModel(prefs.preferred_model);
-          }
-          if (prefs.system_prompt) setUserSystemPrompt(prefs.system_prompt);
-          if (prefs.max_tokens) setUserMaxTokens(prefs.max_tokens);
+        if (prefs.preferred_model && MODELS.some((m) => m.id === prefs.preferred_model)) {
+          setSelectedModel(prefs.preferred_model);
         }
+        if (prefs.system_prompt) setUserSystemPrompt(prefs.system_prompt);
+        if (prefs.max_tokens) setUserMaxTokens(prefs.max_tokens);
 
-        if (!sessionsRes.ok) throw new Error("Failed to load sessions");
-        const data = await sessionsRes.json();
-        if (cancelled) return;
-        const apiSessions: ApiSession[] = data.sessions || [];
+        const apiSessions: ApiSession[] = sessionsResp.sessions || [];
 
         if (apiSessions.length === 0) {
-          const createRes = await fetch("/api/sessions", {
+          const created = await authedFetch<{ session: ApiSession }>("/api/sessions", {
             method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-            body: JSON.stringify({ title: "Session 1", model_id: selectedModel }),
+            body: { title: "Session 1", model_id: selectedModel },
           });
           if (cancelled) return;
-          if (!createRes.ok) throw new Error("Failed to create session");
-          const createData = await createRes.json();
-          const s = createData.session as ApiSession;
+          const s = created.session;
           const first = createNewSession(s.title, s.id);
           setSessions([first]);
           setActiveSessionId(first.id);
@@ -152,19 +159,19 @@ export default function ConsolePage() {
           setSessions(fullSessions);
           const activeId = fullSessions[0].id;
           setActiveSessionId(activeId);
-          // Load messages for active session only
-          const detailRes = await fetch(`/api/sessions/${activeId}`, { headers: { Authorization: `Bearer ${token}` } });
-          if (cancelled) return;
-          if (detailRes.ok) {
-            const detail = await detailRes.json();
-            const apiS = detail.session as ApiSession;
+          try {
+            const detail = await authedFetch<{ session: ApiSession }>(`/api/sessions/${activeId}`);
+            if (cancelled) return;
+            const apiS = detail.session;
             setSessions((prev) =>
               prev.map((s) =>
                 s.id === activeId
-                  ? { ...s, messages: (apiS.messages || []).map((m) => ({ role: m.role, content: decodePayload(m.content), timestamp: m.created_at })) }
+                  ? { ...s, messages: (apiS.messages || []).map((m) => ({ role: m.role, content: m.content, timestamp: m.created_at })) }
                   : s
               )
             );
+          } catch (err) {
+            console.warn("Failed to preload active session messages:", err);
           }
         }
       } catch (err) {
@@ -175,19 +182,19 @@ export default function ConsolePage() {
     }
     loadFromApi();
     return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Save model preference to DB when changed (debounced, skip initial)
   const modelInitRef = useRef(true);
   useEffect(() => {
     if (modelInitRef.current) { modelInitRef.current = false; return; }
-    const timer = setTimeout(async () => {
-      const t = await getAuthToken();
-      if (!t) return;
-      fetch("/api/me/preferences", {
+    const timer = setTimeout(() => {
+      authedFetch("/api/me/preferences", {
         method: "PATCH",
-        headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ preferred_model: selectedModel }),
+        body: { preferred_model: selectedModel },
+      }).catch((err) => {
+        console.warn("Failed to persist model preference:", err);
       });
     }, 500);
     return () => clearTimeout(timer);
@@ -195,22 +202,20 @@ export default function ConsolePage() {
 
   const handleSwitchSession = useCallback(async (sessionId: string) => {
     setActiveSessionId(sessionId);
-    // Load messages if not already loaded
     const session = sessions.find((s) => s.id === sessionId);
     if (session && session.messages.length === 0) {
-      const token = await getAuthToken();
-      if (!token) return;
-      const res = await fetch(`/api/sessions/${sessionId}`, { headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) {
-        const detail = await res.json();
-        const apiS = detail.session as ApiSession;
+      try {
+        const detail = await authedFetch<{ session: ApiSession }>(`/api/sessions/${sessionId}`);
+        const apiS = detail.session;
         setSessions((prev) =>
           prev.map((s) =>
             s.id === sessionId
-              ? { ...s, messages: (apiS.messages || []).map((m: ApiMessage) => ({ role: m.role, content: decodePayload(m.content), timestamp: m.created_at })) }
+              ? { ...s, messages: (apiS.messages || []).map((m: ApiMessage) => ({ role: m.role, content: m.content, timestamp: m.created_at })) }
               : s
           )
         );
+      } catch (err) {
+        toast.error("Couldn't load session messages", err);
       }
     }
   }, [sessions]);
@@ -218,7 +223,6 @@ export default function ConsolePage() {
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
   const messages = activeSession?.messages || [];
 
-  // Auto-scroll to bottom when messages change or session switches
   useEffect(() => {
     setTimeout(() => {
       const el = scrollRef.current;
@@ -226,7 +230,6 @@ export default function ConsolePage() {
     }, 100);
   }, [messages.length, activeSessionId]);
 
-  // Auto-resize textarea
   useEffect(() => {
     const ta = textareaRef.current;
     if (ta) {
@@ -235,37 +238,24 @@ export default function ConsolePage() {
     }
   }, [input]);
 
-  // Debounced cost estimation
+  // Local cost estimation — no backend ping per keystroke. Live quota check
+  // is loaded once on mount via /api/me/quota in the future; for now we just
+  // surface the estimated credits and rely on backend's authoritative
+  // reservation at submission time.
   useEffect(() => {
     const trimmed = input.trim();
     if (!trimmed || trimmed.length < 3) {
       setCostEstimate(null);
       return;
     }
-    const timer = setTimeout(async () => {
-      try {
-        const token = await getAuthToken();
-        if (!token) return;
-        const res = await fetch("/api/me/estimate-cost", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: trimmed, model: selectedModel, max_tokens: userMaxTokens }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setCostEstimate({
-            estimated_credits: data.estimated_credits,
-            total_available: data.total_available,
-            sufficient: data.sufficient,
-            warning_level: data.warning_level,
-          });
-        }
-      } catch {
-        setCostEstimate(null);
-      }
-    }, 800);
-    return () => clearTimeout(timer);
-  }, [input, selectedModel]);
+    const credits = estimateCreditsLocal(trimmed.length, selectedModel, userMaxTokens);
+    setCostEstimate({
+      estimated_credits: credits,
+      // total_available is unknown locally; backend enforces at submit time.
+      total_available: Number.POSITIVE_INFINITY,
+      sufficient: true,
+    });
+  }, [input, selectedModel, userMaxTokens]);
 
   const updateSessionMessages = useCallback(
     (sessionId: string, updater: (msgs: ChatMessage[]) => ChatMessage[]) => {
@@ -282,43 +272,29 @@ export default function ConsolePage() {
 
   const handleNewSession = async () => {
     try {
-      const token = await getAuthToken();
-      if (!token) return;
-      const res = await fetch("/api/sessions", {
+      const data = await authedFetch<{ session: ApiSession }>("/api/sessions", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ title: `Session ${sessions.length + 1}`, model_id: selectedModel }),
+        body: { title: `Session ${sessions.length + 1}`, model_id: selectedModel },
       });
-      if (!res.ok) return;
-      const data = await res.json();
-      const s = data.session as ApiSession;
+      const s = data.session;
       const newSession = createNewSession(s.title, s.id);
       setSessions((prev) => [newSession, ...prev]);
       setActiveSessionId(newSession.id);
-    } catch {
-      /* ignore */
+    } catch (err) {
+      toast.error("Couldn't create session", err);
     }
   };
 
   const handleDeleteSession = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      const token = await getAuthToken();
-      if (token) {
-        await fetch(`/api/sessions/${id}`, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${token}` },
-        });
-      }
-    } catch {
-      /* ignore */
+      await authedFetch(`/api/sessions/${id}`, { method: "DELETE" });
+    } catch (err) {
+      toast.error("Couldn't delete session", err);
+      return;
     }
     const filtered = sessions.filter((s) => s.id !== id);
     if (filtered.length === 0) {
-      // Create new session via API immediately
       handleNewSession();
       return;
     }
@@ -332,33 +308,28 @@ export default function ConsolePage() {
     const newTitle = editingTitle.trim();
     if (!newTitle) { setEditingSessionId(null); return; }
     try {
-      const token = await getAuthToken();
-      if (token) {
-        await fetch(`/api/sessions/${id}`, {
-          method: "PATCH",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ title: newTitle }),
-        });
-      }
-    } catch { /* ignore */ }
+      await authedFetch(`/api/sessions/${id}`, {
+        method: "PATCH",
+        body: { title: newTitle },
+      });
+    } catch (err) {
+      toast.error("Couldn't rename session", err);
+      setEditingSessionId(null);
+      return;
+    }
     setSessions((prev) => prev.map((s) => s.id === id ? { ...s, title: newTitle } : s));
     setEditingSessionId(null);
   };
 
   async function saveMessageToApi(sessionId: string, role: "user" | "assistant", content: string) {
     try {
-      const token = await getAuthToken();
-      if (!token) return;
-      await fetch(`/api/sessions/${sessionId}/messages`, {
+      await authedFetch(`/api/sessions/${sessionId}/messages`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ role, content: encodePayload(content) }),
+        body: { role, content },
       });
-    } catch {
-      /* ignore save failures */
+    } catch (err) {
+      // Persistence failure is non-fatal for the UI but we want to know.
+      console.warn("Failed to persist message:", err);
     }
   }
 
@@ -378,88 +349,51 @@ export default function ConsolePage() {
     const displayContent = selectedFile ? `[📎 ${selectedFile.name}] ${trimmed}` : trimmed;
     const userMsg: ChatMessage = { role: "user", content: displayContent, timestamp: new Date().toISOString() };
 
-    // Build history before adding current message
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
-
-    // Use preferences from DB
     const systemPrompt = userSystemPrompt;
     const maxTokens = userMaxTokens;
 
-    // Clear input immediately
     setInput("");
     setIsProcessing(true);
-
-    // Add user message to UI
     updateSessionMessages(activeSessionId, (prev) => [...prev, userMsg]);
-
-    // Scroll to bottom immediately after user message
     setTimeout(() => {
       const el = scrollRef.current;
       if (el) el.scrollTop = el.scrollHeight;
     }, 50);
 
-    // Persist to API in background (don't await)
     saveMessageToApi(activeSessionId, "user", displayContent);
 
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const token = sessionData.session?.access_token;
-
-      let res: Response;
+      let data: { ai_response?: string };
 
       if (selectedFile) {
-        const formData = new FormData();
-        formData.append("prompt", encodePayload(trimmed));
-        formData.append("model", selectedModel);
-        formData.append("history", JSON.stringify(history.map((m) => ({ role: m.role, content: encodePayload(m.content) }))));
-        if (systemPrompt) formData.append("system_prompt", encodePayload(systemPrompt));
-        formData.append("max_tokens", String(maxTokens));
-        formData.append("file", selectedFile);
+        const fd = new FormData();
+        fd.append("prompt", trimmed);
+        fd.append("model", selectedModel);
+        fd.append("history", JSON.stringify(history));
+        if (systemPrompt) fd.append("system_prompt", systemPrompt);
+        fd.append("max_tokens", String(maxTokens));
+        fd.append("file", selectedFile);
 
-        res = await fetch("/api/mediate", {
-          method: "POST",
-          headers: {
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          body: formData,
-        });
+        data = await authedFetch<{ ai_response?: string }>("/api/mediate", { method: "POST", formData: fd });
         setSelectedFile(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
       } else {
-        const body: Record<string, unknown> = {
-          prompt: encodePayload(trimmed),
-          model: selectedModel,
-          history: history.map((m) => ({ role: m.role, content: encodePayload(m.content) })),
-          max_tokens: maxTokens,
-        };
-        if (systemPrompt) body.system_prompt = encodePayload(systemPrompt);
-
-        res = await fetch("/api/mediate", {
+        data = await authedFetch<{ ai_response?: string }>("/api/mediate", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          body: {
+            prompt: trimmed,
+            model: selectedModel,
+            history,
+            max_tokens: maxTokens,
+            ...(systemPrompt ? { system_prompt: systemPrompt } : {}),
           },
-          body: JSON.stringify(body),
         });
       }
 
-      if (!res.ok) {
-        let detail = `Broker pipeline error (${res.status})`;
-        try {
-          const errJson = await res.json();
-          detail = errJson.detail || errJson.error || detail;
-        } catch {
-          /* backend returned non-JSON error */
-        }
-        throw new Error(detail);
-      }
-
-      const data = await res.json();
-
       const assistantMsg: ChatMessage = {
         role: "assistant",
-        content: decodePayload(data.ai_response) || "No response received.",
+        content: data.ai_response || "No response received.",
         timestamp: new Date().toISOString(),
       };
 
@@ -515,7 +449,6 @@ export default function ConsolePage() {
   return (
     <AppShell>
       <div className="flex h-[calc(100vh-3rem)] -mx-6 md:-mx-8 -mt-6 -mb-8">
-        {/* Sidebar */}
         <AnimatePresence initial={false}>
           {sidebarOpen && (
             <motion.aside
@@ -590,9 +523,7 @@ export default function ConsolePage() {
           )}
         </AnimatePresence>
 
-        {/* Main Chat Area */}
         <div className="flex-1 flex flex-col min-w-0">
-          {/* Toggle sidebar + model selector bar */}
           <div className="shrink-0 px-4 py-2 border-b border-outline-variant/20 flex items-center gap-3">
             <button
               onClick={() => setSidebarOpen((v) => !v)}
@@ -625,7 +556,6 @@ export default function ConsolePage() {
             )}
           </div>
 
-          {/* Messages */}
           <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
             <AnimatePresence>
               {messages.length === 0 && (
@@ -708,7 +638,6 @@ export default function ConsolePage() {
             </AnimatePresence>
           </div>
 
-          {/* Input Area */}
           <div className="shrink-0 border-t border-outline-variant/20 px-4 md:px-6 py-3 pb-6 backdrop-blur-md">
             <form onSubmit={dispatchPayload} className="flex items-end gap-3 max-w-4xl mx-auto">
               <input
@@ -769,7 +698,7 @@ export default function ConsolePage() {
                   disabled={isProcessing}
                   style={{ minHeight: "44px" }}
                 />
-                {costEstimate && !costEstimate.sufficient && (
+                {costEstimate && Number.isFinite(costEstimate.total_available) && !costEstimate.sufficient && (
                   <div className="absolute -bottom-5 left-0 text-[10px] font-mono text-error flex items-center gap-1.5">
                     Insufficient credits ({costEstimate.total_available} available, need ~{costEstimate.estimated_credits})
                   </div>

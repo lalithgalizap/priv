@@ -1,67 +1,43 @@
-import { NextRequest, NextResponse } from "next/server";
+import { dispatchEnvelope } from "@/lib/envelope";
+import { callBackend } from "@/lib/backend";
+import { NextRequest } from "next/server";
 
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
-
-export async function GET(request: NextRequest) {
-  try {
-    const authHeader = request.headers.get("authorization");
-    const { searchParams } = new URL(request.url);
-    const queryString = searchParams.toString();
-    const url = `${BACKEND_URL}/api/v1/admin/users${queryString ? `?${queryString}` : ""}`;
-    const res = await fetch(url, {
-      headers: authHeader ? { Authorization: authHeader } : {},
+export const POST = dispatchEnvelope({
+  GET: async (ctx) => {
+    const url = new URL((ctx.request as NextRequest).url);
+    const query: Record<string, string> = {};
+    url.searchParams.forEach((v, k) => { query[k] = v; });
+    const res = await callBackend({
+      path: "/api/v1/admin/users",
+      authHeader: ctx.authHeader,
+      query,
     });
-    if (!res.ok) {
-      const text = await res.text();
-      return NextResponse.json({ error: text.slice(0, 200) }, { status: res.status });
-    }
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ error: "Service unavailable." }, { status: 500 });
-  }
-}
-
-export async function PATCH(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const id = searchParams.get("id");
-    if (!id) return NextResponse.json({ error: "Missing id." }, { status: 400 });
-    const authHeader = request.headers.get("authorization");
-    const body = await request.json();
-    const res = await fetch(`${BACKEND_URL}/api/v1/admin/users/${encodeURIComponent(id)}/role`, {
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+  PATCH: async (ctx) => {
+    const url = new URL((ctx.request as NextRequest).url);
+    const id = url.searchParams.get("id") || (ctx.body as { id?: string })?.id;
+    if (!id) ctx.fail(400, "Missing id.");
+    const res = await callBackend({
       method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        ...(authHeader ? { Authorization: authHeader } : {}),
-      },
-      body: JSON.stringify(body),
+      path: `/api/v1/admin/users/${encodeURIComponent(id!)}/role`,
+      authHeader: ctx.authHeader,
+      body: ctx.body,
     });
-    if (!res.ok) {
-      const text = await res.text();
-      return NextResponse.json({ error: text.slice(0, 200) }, { status: res.status });
-    }
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ error: "Service unavailable." }, { status: 500 });
-  }
-}
-
-export async function DELETE(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const id = searchParams.get("id");
-    if (!id) return NextResponse.json({ error: "Missing id." }, { status: 400 });
-    const authHeader = request.headers.get("authorization");
-    const res = await fetch(`${BACKEND_URL}/api/v1/admin/users/${encodeURIComponent(id)}`, {
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+  DELETE: async (ctx) => {
+    const url = new URL((ctx.request as NextRequest).url);
+    const id = url.searchParams.get("id") || (ctx.body as { id?: string })?.id;
+    if (!id) ctx.fail(400, "Missing id.");
+    const res = await callBackend({
       method: "DELETE",
-      headers: authHeader ? { Authorization: authHeader } : {},
+      path: `/api/v1/admin/users/${encodeURIComponent(id!)}`,
+      authHeader: ctx.authHeader,
     });
-    if (!res.ok) {
-      const text = await res.text();
-      return NextResponse.json({ error: text.slice(0, 200) }, { status: res.status });
-    }
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ error: "Service unavailable." }, { status: 500 });
-  }
-}
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+});

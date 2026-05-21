@@ -1,32 +1,23 @@
-import { NextRequest, NextResponse } from "next/server";
+import { dispatchEnvelope } from "@/lib/envelope";
+import { callBackend } from "@/lib/backend";
 
-const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
-
-export async function GET(request: NextRequest) {
-  try {
-    const authHeader = request.headers.get("authorization");
-    const res = await fetch(`${BACKEND_URL}/api/v1/org/settings`, {
-      headers: authHeader ? { Authorization: authHeader } : {},
+export const POST = dispatchEnvelope({
+  GET: async (ctx) => {
+    const res = await callBackend({
+      path: "/api/v1/org/settings",
+      authHeader: ctx.authHeader,
     });
-    if (!res.ok) return NextResponse.json({ error: "Failed" }, { status: res.status });
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ error: "Service unavailable." }, { status: 500 });
-  }
-}
-
-export async function PATCH(request: NextRequest) {
-  try {
-    const authHeader = request.headers.get("authorization");
-    const body = await request.json();
-    const res = await fetch(`${BACKEND_URL}/api/v1/org/settings`, {
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+  PATCH: async (ctx) => {
+    const res = await callBackend({
       method: "PATCH",
-      headers: { "Content-Type": "application/json", ...(authHeader ? { Authorization: authHeader } : {}) },
-      body: JSON.stringify(body),
+      path: "/api/v1/org/settings",
+      authHeader: ctx.authHeader,
+      body: ctx.body,
     });
-    if (!res.ok) return NextResponse.json({ error: "Failed" }, { status: res.status });
-    return NextResponse.json(await res.json());
-  } catch {
-    return NextResponse.json({ error: "Service unavailable." }, { status: 500 });
-  }
-}
+    if (!res.ok) ctx.fail(res.status, (res.data as { error?: string })?.error || `HTTP ${res.status}`);
+    return res.data;
+  },
+});

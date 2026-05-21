@@ -3,9 +3,19 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { supabase } from "@/lib/supabase";
-import { Mail, Key, UserPlus, Terminal, ShieldCheck, Lock, Loader2 } from "lucide-react";
+import { Mail, Key, UserPlus, ShieldCheck, Lock, Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
+import { signup, getAccessToken } from "@/lib/auth";
+import { apiFetch } from "@/lib/api";
+import { authedFetch } from "@/lib/auth";
+
+interface InviteValidation {
+  valid: boolean;
+  email?: string;
+  tenant_id?: string;
+  tenant_name?: string;
+  role?: string;
+}
 
 export default function SignupPage() {
   const router = useRouter();
@@ -20,7 +30,6 @@ export default function SignupPage() {
   const [inviteValid, setInviteValid] = useState(false);
   const [inviteEmail, setInviteEmail] = useState<string | null>(null);
 
-  // Gate signup behind a valid invite token
   useEffect(() => {
     async function validateToken() {
       const token = localStorage.getItem("pending_invite_token");
@@ -30,11 +39,12 @@ export default function SignupPage() {
       }
       setInviteToken(token);
       try {
-        const res = await fetch(`/api/invite/validate?token=${encodeURIComponent(token)}`);
-        if (res.ok) {
-          const data = await res.json();
+        const data = await apiFetch<InviteValidation>("/api/invite/validate", {
+          method: "POST",
+          body: { token },
+        });
+        if (data && data.valid) {
           setInviteValid(true);
-          // Lock email to the one specified in the invite
           if (data.email) {
             setInviteEmail(data.email);
             setEmail(data.email);
@@ -51,7 +61,6 @@ export default function SignupPage() {
       }
     }
     validateToken();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleSignup(e: React.FormEvent) {
@@ -77,42 +86,33 @@ export default function SignupPage() {
       return;
     }
 
-    const { data, error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        emailRedirectTo: `${window.location.origin}/login`,
-      },
-    });
-
-    if (error) {
-      setError(error.message);
-    } else if (data.session) {
-      // Auto-login when email confirmation is disabled
-      document.cookie = `sb-access-token=${data.session.access_token}; path=/; max-age=604800`;
-      // Auto-accept the invite immediately after signup
+    try {
+      const result = await signup(email, password);
+      if (result.email_confirmation_required) {
+        setSuccess(true);
+        setLoading(false);
+        return;
+      }
+      // Auto-accept the invite using the new session
+      const token = await getAccessToken();
+      if (!token) {
+        setError("Sign up succeeded but session was not established.");
+        setLoading(false);
+        return;
+      }
       try {
-        const acceptRes = await fetch("/api/invite/accept", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${data.session.access_token}` },
-          body: JSON.stringify({ token: inviteToken }),
-        });
-        if (acceptRes.ok) {
-          localStorage.removeItem("pending_invite_token");
-          router.push("/console");
-        } else {
-          // Fallback: redirect to /join to accept manually
-          router.push("/join");
-        }
+        await authedFetch("/api/invite/accept", { method: "POST", body: { token: inviteToken } });
+        localStorage.removeItem("pending_invite_token");
+        router.push("/console");
       } catch {
         router.push("/join");
       }
-    } else if (data.user) {
-      // Email confirmation required — show success message
-      setSuccess(true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Sign up failed.";
+      setError(msg);
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   }
 
   return (
@@ -191,7 +191,7 @@ export default function SignupPage() {
                   </div>
                   <h3 className="text-lg font-semibold text-on-surface">Account Created</h3>
                   <p className="text-sm text-on-surface-variant text-center max-w-sm">
-                    Redirecting to accept your invitation...
+                    Check your inbox to verify your email, then sign in.
                   </p>
                   <Link href="/login" className="text-primary hover:underline font-mono text-sm">
                     Go to Sign In
@@ -283,7 +283,7 @@ export default function SignupPage() {
 
               <div className="mt-8 pt-6 border-t border-outline-variant/10 flex items-center justify-center gap-2 text-outline-variant font-mono text-sm relative z-10">
                 <ShieldCheck className="w-4 h-4 text-secondary" />
-                Secured by Supabase Auth
+                Encrypted end-to-end
               </div>
             </div>
           </motion.div>

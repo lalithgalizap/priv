@@ -3,7 +3,8 @@
 import { useEffect, useState, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { supabase } from "@/lib/supabase";
+import { apiFetch } from "@/lib/api";
+import { authedFetch, getAccessToken, getCachedUser } from "@/lib/auth";
 import {
   Loader2,
   AlertTriangle,
@@ -37,23 +38,19 @@ function JoinContent() {
   const [userEmail, setUserEmail] = useState("");
 
   useEffect(() => {
-    // Save token to localStorage so users can return after login
-    if (token) {
-      localStorage.setItem("pending_invite_token", token);
-    }
+    if (token) localStorage.setItem("pending_invite_token", token);
   }, [token]);
 
   useEffect(() => {
     async function init() {
-      // Check auth state
-      const { data: sesh } = await supabase.auth.getSession();
-      const loggedIn = !!sesh.session;
+      const sessionToken = await getAccessToken();
+      const loggedIn = !!sessionToken;
       setIsLoggedIn(loggedIn);
-      if (sesh.session?.user?.email) {
-        setUserEmail(sesh.session.user.email);
+      if (loggedIn) {
+        const cached = getCachedUser();
+        if (cached?.email) setUserEmail(cached.email);
       }
 
-      // Use URL token or fallback to localStorage
       const effectiveToken = token || localStorage.getItem("pending_invite_token") || "";
       if (!effectiveToken) {
         setError("No invite token found. Please use the link from your invite email.");
@@ -62,40 +59,36 @@ function JoinContent() {
       }
 
       try {
-        const res = await fetch(`/api/invite/validate?token=${encodeURIComponent(effectiveToken)}`);
-        if (!res.ok) {
-          // Stale token in localStorage after DB wipe — clear it and redirect
-          localStorage.removeItem("pending_invite_token");
-          router.push("/console");
-          return;
-        } else {
-          const data = await res.json();
-          setInvite(data);
+        const data = await apiFetch<InviteDetails>("/api/invite/validate", {
+          method: "POST",
+          body: { token: effectiveToken },
+        });
+        setInvite(data);
 
-          // Auto-accept if user is already logged in
-          if (loggedIn && sesh.session?.access_token) {
-            setAccepting(true);
-            const acceptRes = await fetch("/api/invite/accept", {
+        if (loggedIn && sessionToken) {
+          setAccepting(true);
+          try {
+            await authedFetch("/api/invite/accept", {
               method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${sesh.session.access_token}` },
-              body: JSON.stringify({ token: effectiveToken }),
+              body: { token: effectiveToken },
             });
-            if (acceptRes.ok) {
-              setAccepted(true);
-              localStorage.removeItem("pending_invite_token");
-              setTimeout(() => router.push("/console"), 1500);
-            } else {
-              setAccepting(false);
-            }
+            setAccepted(true);
+            localStorage.removeItem("pending_invite_token");
+            setTimeout(() => router.push("/console"), 1500);
+          } catch {
+            setAccepting(false);
           }
         }
       } catch {
-        setError("Network error. Please try again.");
+        localStorage.removeItem("pending_invite_token");
+        router.push("/console");
+        return;
       } finally {
         setLoading(false);
       }
     }
     init();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
   async function handleAccept() {
@@ -103,27 +96,15 @@ function JoinContent() {
     if (!effectiveToken) return;
     setAccepting(true);
     try {
-      const { data: sesh } = await supabase.auth.getSession();
-      const t = sesh.session?.access_token;
-      if (!t) {
-        setError("Session expired. Please log in again.");
-        return;
-      }
-      const res = await fetch("/api/invite/accept", {
+      await authedFetch("/api/invite/accept", {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` },
-        body: JSON.stringify({ token: effectiveToken }),
+        body: { token: effectiveToken },
       });
-      if (res.ok) {
-        setAccepted(true);
-        localStorage.removeItem("pending_invite_token");
-        setTimeout(() => router.push("/console"), 1500);
-      } else {
-        const err = await res.json();
-        setError(err.error || "Failed to accept invite.");
-      }
-    } catch {
-      setError("Network error.");
+      setAccepted(true);
+      localStorage.removeItem("pending_invite_token");
+      setTimeout(() => router.push("/console"), 1500);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to accept invite.");
     } finally {
       setAccepting(false);
     }
@@ -202,12 +183,21 @@ function JoinContent() {
         </div>
 
         {isLoggedIn ? (
-          <div className="space-y-3 text-center">
-            <Loader2 className="w-6 h-6 animate-spin mx-auto text-primary" />
-            <p className="text-xs text-outline font-mono">
-              Accepting invite as <span className="text-on-surface">{userEmail}</span>...
-            </p>
-          </div>
+          accepting ? (
+            <div className="space-y-3 text-center">
+              <Loader2 className="w-6 h-6 animate-spin mx-auto text-primary" />
+              <p className="text-xs text-outline font-mono">
+                Accepting invite as <span className="text-on-surface">{userEmail}</span>...
+              </p>
+            </div>
+          ) : (
+            <button
+              onClick={handleAccept}
+              className="w-full py-3 rounded-lg text-xs font-mono bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20 transition-all flex items-center justify-center gap-2"
+            >
+              Accept Invite
+            </button>
+          )
         ) : (
           <div className="space-y-3">
             <p className="text-xs text-center text-outline font-mono">

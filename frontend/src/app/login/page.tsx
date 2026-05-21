@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "@/lib/supabase";
+import { login } from "@/lib/auth";
 import { Mail, Key, Loader2 } from "lucide-react";
 
 export default function LoginPage() {
@@ -16,24 +16,24 @@ export default function LoginPage() {
     e.preventDefault();
     setLoading(true);
     setError("");
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) {
-      setError(error.message);
-    } else if (data.session) {
-      document.cookie = `sb-access-token=${data.session.access_token}; path=/; max-age=604800`;
+    try {
+      await login(email, password);
       const pendingToken = localStorage.getItem("pending_invite_token");
       if (pendingToken) {
         router.push("/join");
       } else {
         router.push("/console");
       }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Login failed.";
+      setError(msg);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }
 
   return (
     <div className="min-h-screen flex relative overflow-hidden" style={{ background: "#0b0e14", backgroundImage: "radial-gradient(circle at 30% 50%, #2a3f95 0%, transparent 40%)" }}>
-      {/* Left side — Logo + Brand */}
       <div className="hidden lg:flex flex-1 items-center justify-center relative">
         <div className="absolute inset-0 bg-primary/5 blur-[120px] rounded-full pointer-events-none" />
         <div className="relative z-10 flex flex-col items-center">
@@ -44,10 +44,8 @@ export default function LoginPage() {
         </div>
       </div>
 
-      {/* Right side — Login form */}
       <div className="flex-1 flex items-center justify-center px-6 lg:px-16">
         <div className="w-full max-w-sm">
-          {/* Mobile logo */}
           <div className="lg:hidden flex items-center gap-3 mb-8">
             <img src="/logo.png" alt="Quintal AI" className="w-10 h-10 object-contain" />
             <span className="font-sans text-xl font-bold text-on-surface">Quintal AI</span>
