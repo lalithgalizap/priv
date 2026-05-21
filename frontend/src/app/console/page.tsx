@@ -347,10 +347,10 @@ export default function ConsolePage() {
 
     const trimmed = input.trim();
     if (trimmed.length > 10000) {
-      updateSessionMessages(activeSessionId, (prev) => [
-        ...prev,
-        { role: "assistant", content: "Error: Prompt exceeds 10,000 character limit.", timestamp: new Date().toISOString() },
-      ]);
+      toast.error(
+        "Message too long",
+        "Messages are capped at 10,000 characters. Trim your prompt and try again."
+      );
       return;
     }
 
@@ -408,9 +408,35 @@ export default function ConsolePage() {
       updateSessionMessages(activeSessionId, (prev) => [...prev, assistantMsg]);
       await saveMessageToApi(activeSessionId, "assistant", assistantMsg.content);
     } catch (err) {
+      // Translate technical errors into a user-facing summary. The full reason
+      // is surfaced via toast for users who need it; the chat bubble stays
+      // clean. We never paste raw "Error: HTTP 429" strings into the thread.
+      const status = (err as { status?: number } | null)?.status;
+      const rawMessage = err instanceof Error ? err.message : "";
+      let friendly: string;
+      let toastTitle = "Couldn't send message";
+      if (status === 429) {
+        toastTitle = "Out of credits";
+        friendly = "You've run out of credits for the day. Ask your organization leader to top up, or come back tomorrow.";
+      } else if (status === 413) {
+        toastTitle = "File too large";
+        friendly = "The attached file is over the 5 MB limit. Try a smaller file or paste the relevant excerpt.";
+      } else if (status === 401 || status === 403) {
+        toastTitle = "Session expired";
+        friendly = "Your session expired. Please sign in again.";
+      } else if (status === 503) {
+        toastTitle = "AI provider unavailable";
+        friendly = "The AI service is temporarily unavailable. Try again in a moment.";
+      } else if (status === 502) {
+        toastTitle = "Upstream error";
+        friendly = "The selected model returned an error. Try a different model or rephrase the prompt.";
+      } else {
+        friendly = "Something went wrong sending that message. Please try again.";
+      }
+      toast.error(toastTitle, rawMessage || friendly);
       const errorMsg: ChatMessage = {
         role: "assistant",
-        content: "Error: " + (err instanceof Error ? err.message : "Unknown error"),
+        content: friendly,
         timestamp: new Date().toISOString(),
       };
       updateSessionMessages(activeSessionId, (prev) => [...prev, errorMsg]);

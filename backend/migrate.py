@@ -135,7 +135,7 @@ MIGRATIONS = [
     # Daily budget system
     """
     ALTER TABLE user_profiles
-    ADD COLUMN IF NOT EXISTS daily_budget BIGINT DEFAULT 50,
+    ADD COLUMN IF NOT EXISTS daily_budget BIGINT DEFAULT 5000,
     ADD COLUMN IF NOT EXISTS daily_used BIGINT DEFAULT 0,
     ADD COLUMN IF NOT EXISTS last_token_reset TIMESTAMP WITH TIME ZONE DEFAULT NOW();
     """,
@@ -143,9 +143,9 @@ MIGRATIONS = [
     ALTER TABLE tenants
     ADD COLUMN IF NOT EXISTS extra_token_pool BIGINT DEFAULT 0;
     """,
-    # Clean slate: wipe old token limits/baselines, set 50 daily for everyone
+    # Clean slate: wipe old token limits/baselines, set 5000 daily for everyone
     """
-    UPDATE user_profiles SET token_limit = NULL, token_baseline = 0, daily_budget = 50, daily_used = 0, last_token_reset = NOW();
+    UPDATE user_profiles SET token_limit = NULL, token_baseline = 0, daily_budget = 5000, daily_used = 0, last_token_reset = NOW();
     """,
     """
     UPDATE tenants SET token_limit = NULL, token_baseline = 0, extra_token_pool = 0;
@@ -281,6 +281,16 @@ MIGRATIONS = [
         'deepseek.r1-v1:0',
         'mistral.mistral-7b-instruct-v0:2'
     );
+    """,
+    # ── Bump daily budget default + raise existing users from the 50 default
+    # to 5000 so a single document upload doesn't exhaust their quota.
+    # Users / orgs whose budget was customised above the 50 default are left
+    # alone via the daily_budget < 5000 guard.
+    """
+    ALTER TABLE user_profiles ALTER COLUMN daily_budget SET DEFAULT 5000;
+    """,
+    """
+    UPDATE user_profiles SET daily_budget = 5000 WHERE daily_budget < 5000;
     """,
 ]
 

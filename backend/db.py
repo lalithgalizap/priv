@@ -1385,9 +1385,9 @@ def _maybe_reset_daily_tokens(cur, supabase_auth_id: str) -> tuple[int, int, int
     )
     row = cur.fetchone()
     if not row:
-        return 100, 0, 0, 0
+        return 5000, 0, 0, 0
 
-    daily_budget = int(row[0] or 100)
+    daily_budget = int(row[0] or 5000)
     daily_used = int(row[1] or 0)
     last_reset = row[2]
     extra_allocated = int(row[3] or 0) if row[3] is not None else 0
@@ -1632,7 +1632,7 @@ def reserve_credits(supabase_auth_id: str, tenant_id: str, estimated_credits: in
                 conn.commit()
                 return {"allowed": False, "reason": "User profile not found.", "reserved_credits": 0}
 
-            daily_budget = int(row[0] or 100)
+            daily_budget = int(row[0] or 5000)
             daily_used = int(row[1] or 0)
             last_reset = row[2]
             extra_allocated = int(row[3] or 0) if row[3] is not None else 0
