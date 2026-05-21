@@ -36,7 +36,7 @@ async function importServerPub(serverPubB64: string): Promise<CryptoKey> {
   const raw = b64ToBytes(serverPubB64);
   const key = await crypto.subtle.importKey(
     "raw",
-    raw,
+    raw as BufferSource,
     { name: "ECDH", namedCurve: "P-256" },
     false,
     []
