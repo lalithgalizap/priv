@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Sora, JetBrains_Mono, Inter } from "next/font/google";
 import "./globals.css";
 import ToastViewport from "@/components/ToastViewport";
@@ -25,6 +25,18 @@ const jetbrains = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "Quintal AI",
   description: "Enterprise AI Platform",
+};
+
+// Mobile-aware viewport: viewportFit=cover lets us paint into iPhone notch/home-bar
+// area (we then restore safe-area padding via env(safe-area-inset-*)).
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: dark)", color: "#0b0e14" },
+    { media: "(prefers-color-scheme: light)", color: "#f8fafc" },
+  ],
 };
 
 export default function RootLayout({

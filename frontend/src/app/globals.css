@@ -87,13 +87,27 @@
 
 html {
   scroll-behavior: smooth;
+  /* Prevent iOS Safari from auto-resizing fonts on landscape rotation. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
   background-color: var(--t-background);
   color: var(--t-on-surface);
   font-family: 'Inter', 'Sora', sans-serif;
-  min-height: 100vh;
+  /* dvh keeps the layout stable when iOS toolbars expand/collapse. */
+  min-height: 100dvh;
+  /* Prevent horizontal scroll bleed-through on small screens. */
+  overflow-x: hidden;
+}
+
+/* iOS safe-area variables exposed to Tailwind arbitrary values via CSS vars. */
+:root {
+  --sat: env(safe-area-inset-top);
+  --sar: env(safe-area-inset-right);
+  --sab: env(safe-area-inset-bottom);
+  --sal: env(safe-area-inset-left);
 }
 
 @layer utilities {
@@ -109,6 +123,18 @@ body {
     -webkit-backdrop-filter: blur(20px);
     border: 1px solid color-mix(in srgb, var(--t-outline-variant) 40%, transparent);
   }
+  /* Safe-area helpers. Use as .pt-safe / .pb-safe / .px-safe. */
+  .pt-safe { padding-top: env(safe-area-inset-top); }
+  .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+  .pl-safe { padding-left: env(safe-area-inset-left); }
+  .pr-safe { padding-right: env(safe-area-inset-right); }
+  .px-safe {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  /* Dynamic-viewport-height helpers for iOS keyboards / Safari toolbars. */
+  .min-h-dvh { min-height: 100dvh; }
+  .h-dvh { height: 100dvh; }
 }
 
 ::selection {
@@ -123,5 +149,15 @@ body {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+/* Slide-in for mobile drawer (used in AppShell). */
+@keyframes slideInLeft {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
   }
 }

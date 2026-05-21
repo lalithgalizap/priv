@@ -91,6 +91,8 @@ function createNewSession(title = "New Session", id?: string): ChatSession {
 export default function ConsolePage() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // Sidebar starts closed on mobile, open on desktop. We can't read window during
+  // SSR so we initialise from a media query in an effect below.
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [input, setInput] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -126,6 +128,11 @@ export default function ConsolePage() {
 
   // Load preferences + sessions on mount
   useEffect(() => {
+    // Default sidebar state: closed on mobile (under md = 768px), open on desktop.
+    // We do this in an effect because window doesn't exist during SSR.
+    if (typeof window !== "undefined") {
+      setSidebarOpen(window.matchMedia("(min-width: 768px)").matches);
+    }
     let cancelled = false;
     async function loadFromApi() {
       try {
@@ -449,22 +456,37 @@ export default function ConsolePage() {
 
   return (
     <AppShell>
-      <div className="flex h-[calc(100vh-3rem)] -mx-6 md:-mx-8 -mt-6 -mb-8">
+      {/*
+        Console layout. Two responsive variants share the same React tree:
+        - md+ : the session sidebar lives inline (animated width) next to the chat.
+        - <md : the same sidebar becomes a slide-in overlay drawer with a backdrop.
+        We use 100dvh so iOS keyboard / Safari toolbar don't clip the input bar.
+      */}
+      <div className="flex h-[calc(100dvh-3.5rem-env(safe-area-inset-top))] md:h-[calc(100dvh-3rem)] -mx-4 sm:-mx-6 md:-mx-8 -mt-[calc(3.5rem+env(safe-area-inset-top))] md:-mt-6 -mb-8 pt-[calc(3.5rem+env(safe-area-inset-top))] md:pt-0 relative">
+        {/* Mobile backdrop — only visible when drawer is open under md. */}
+        {sidebarOpen && (
+          <div
+            className="md:hidden absolute inset-0 bg-black/50 backdrop-blur-sm z-30"
+            onClick={() => setSidebarOpen(false)}
+            aria-hidden="true"
+          />
+        )}
         <AnimatePresence initial={false}>
           {sidebarOpen && (
             <motion.aside
-              initial={{ width: 0, opacity: 0 }}
-              animate={{ width: 260, opacity: 1 }}
-              exit={{ width: 0, opacity: 0 }}
-              transition={{ duration: 0.25 }}
-              className="border-r border-outline-variant/20 bg-surface-container/20 overflow-hidden flex flex-col shrink-0"
+              initial={{ x: -260, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: -260, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="border-r border-outline-variant/20 bg-surface-container/95 md:bg-surface-container/20 backdrop-blur-md md:backdrop-blur-none overflow-hidden flex flex-col shrink-0 z-40 absolute md:static top-0 bottom-0 left-0 w-[280px] max-w-[85vw] md:w-[260px]"
             >
               <div className="p-4 border-b border-outline-variant/20 flex items-center justify-between">
                 <span className="font-mono text-xs text-outline-variant uppercase tracking-wider">Sessions</span>
                 <button
                   onClick={handleNewSession}
-                  className="w-7 h-7 flex items-center justify-center rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-colors"
+                  className="w-9 h-9 flex items-center justify-center rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-colors"
                   title="New session"
+                  aria-label="New session"
                 >
                   <Plus className="w-4 h-4" />
                 </button>
@@ -508,10 +530,10 @@ export default function ConsolePage() {
                     )}
                     {editingSessionId !== session.id && (
                       <>
-                        <span className="text-[10px] font-mono opacity-40">{formatTime(session.updatedAt)}</span>
+                        <span className="text-[10px] font-mono opacity-40 hidden sm:inline">{formatTime(session.updatedAt)}</span>
                         {sessions.length > 1 && (
                           <Trash2
-                            className="w-3.5 h-3.5 text-outline-variant opacity-0 group-hover:opacity-60 hover:text-error hover:opacity-100 transition-all shrink-0 cursor-pointer"
+                            className="w-4 h-4 text-outline-variant opacity-60 md:opacity-0 md:group-hover:opacity-60 hover:text-error md:hover:opacity-100 transition-all shrink-0 cursor-pointer p-0.5"
                             onClick={(e) => handleDeleteSession(session.id, e)}
                           />
                         )}
@@ -525,20 +547,21 @@ export default function ConsolePage() {
         </AnimatePresence>
 
         <div className="flex-1 flex flex-col min-w-0">
-          <div className="shrink-0 px-4 py-2 border-b border-outline-variant/20 flex items-center gap-3">
+          <div className="shrink-0 px-3 sm:px-4 py-2 border-b border-outline-variant/20 flex items-center gap-2 sm:gap-3">
             <button
               onClick={() => setSidebarOpen((v) => !v)}
-              className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-surface-container/40 text-outline-variant transition-colors"
+              className="w-9 h-9 flex items-center justify-center rounded-lg hover:bg-surface-container/40 text-outline-variant transition-colors shrink-0"
               title={sidebarOpen ? "Close sidebar" : "Open sidebar"}
+              aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
             >
               {sidebarOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeft className="w-4 h-4" />}
             </button>
-            <span className="font-mono text-xs text-outline-variant uppercase tracking-wider">Model:</span>
+            <span className="font-mono text-xs text-outline-variant uppercase tracking-wider hidden sm:inline">Model:</span>
             <select
               value={selectedModel}
               onChange={(e) => setSelectedModel(e.target.value)}
               disabled={isProcessing}
-              className="bg-surface-container/40 border border-outline-variant/20 rounded-lg px-3 py-1 text-xs text-on-surface focus:outline-none focus:border-primary transition-all cursor-pointer font-mono"
+              className="bg-surface-container/40 border border-outline-variant/20 rounded-lg px-2 sm:px-3 py-1.5 text-xs text-on-surface focus:outline-none focus:border-primary transition-all cursor-pointer font-mono min-w-0 truncate"
             >
               {MODELS.map((m) => (
                 <option key={m.id} value={m.id}>
@@ -549,21 +572,22 @@ export default function ConsolePage() {
             {!sidebarOpen && (
               <button
                 onClick={handleNewSession}
-                className="ml-auto w-7 h-7 flex items-center justify-center rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-colors"
+                className="ml-auto w-9 h-9 flex items-center justify-center rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition-colors shrink-0"
                 title="New session"
+                aria-label="New session"
               >
                 <Plus className="w-4 h-4" />
               </button>
             )}
           </div>
 
-          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 space-y-4">
             <AnimatePresence>
               {messages.length === 0 && (
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
-                  className="flex flex-col items-center justify-center h-full text-center space-y-4"
+                  className="flex flex-col items-center justify-center h-full text-center space-y-4 px-4"
                 >
                   <div className="w-16 h-16 rounded-2xl bg-surface-container/40 border border-outline-variant/20 flex items-center justify-center">
                     <Bot className="w-8 h-8 text-primary" />
@@ -583,7 +607,7 @@ export default function ConsolePage() {
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ duration: 0.3 }}
-                  className={`flex gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                  className={`flex gap-2 sm:gap-3 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                 >
                   {msg.role === "assistant" && (
                     <div className="w-8 h-8 rounded-lg bg-surface-container/40 border border-outline-variant/20 flex items-center justify-center shrink-0 mt-1">
@@ -591,7 +615,7 @@ export default function ConsolePage() {
                     </div>
                   )}
                   <div
-                    className={`max-w-3xl px-4 py-3 rounded-xl text-sm leading-relaxed overflow-x-auto ${
+                    className={`max-w-[85%] sm:max-w-[80%] md:max-w-3xl px-4 py-3 rounded-xl text-sm leading-relaxed overflow-x-auto ${
                       msg.role === "user"
                         ? "bg-primary/10 border border-primary/20 text-on-surface"
                         : "bg-surface-container/40 border border-outline-variant/20 text-on-surface"
@@ -602,7 +626,7 @@ export default function ConsolePage() {
                         <LazyMarkdown>{msg.content}</LazyMarkdown>
                       </div>
                     ) : (
-                      <span className="whitespace-pre-wrap">{msg.content}</span>
+                      <span className="whitespace-pre-wrap break-words">{msg.content}</span>
                     )}
                   </div>
                   {msg.role === "user" && (
@@ -637,8 +661,8 @@ export default function ConsolePage() {
             </AnimatePresence>
           </div>
 
-          <div className="shrink-0 border-t border-outline-variant/20 px-4 md:px-6 py-3 pb-6 backdrop-blur-md">
-            <form onSubmit={dispatchPayload} className="flex items-end gap-3 max-w-4xl mx-auto">
+          <div className="shrink-0 border-t border-outline-variant/20 px-3 sm:px-4 md:px-6 py-3 pb-[max(env(safe-area-inset-bottom),1rem)] backdrop-blur-md">
+            <form onSubmit={dispatchPayload} className="flex items-end gap-2 sm:gap-3 max-w-4xl mx-auto">
               <input
                 type="file"
                 ref={fileInputRef}
@@ -653,28 +677,30 @@ export default function ConsolePage() {
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isProcessing}
-                className={`w-10 h-10 flex items-center justify-center rounded-xl border transition-all disabled:opacity-40 shrink-0 mb-0.5 ${
+                className={`w-11 h-11 flex items-center justify-center rounded-xl border transition-all disabled:opacity-40 shrink-0 mb-0.5 ${
                   selectedFile
                     ? "bg-primary/10 border-primary/30 text-primary"
                     : "bg-surface-container/40 border-outline-variant/20 text-outline hover:text-primary hover:border-primary/30"
                 }`}
                 title="Attach document"
+                aria-label="Attach document"
               >
                 <Paperclip className="w-5 h-5" />
               </button>
-              <div className="flex-1 relative">
+              <div className="flex-1 relative min-w-0">
                 {selectedFile && (
-                  <div className="mb-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary/5 border border-primary/20">
-                    <Paperclip className="w-3.5 h-3.5 text-primary" />
-                    <span className="text-xs font-medium text-on-surface truncate max-w-[200px]">{selectedFile.name}</span>
-                    <span className="text-[10px] text-outline font-mono">({(selectedFile.size / 1024).toFixed(0)} KB)</span>
+                  <div className="mb-2 inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary/5 border border-primary/20 max-w-full">
+                    <Paperclip className="w-3.5 h-3.5 text-primary shrink-0" />
+                    <span className="text-xs font-medium text-on-surface truncate max-w-[120px] sm:max-w-[200px]">{selectedFile.name}</span>
+                    <span className="text-[10px] text-outline font-mono shrink-0">({(selectedFile.size / 1024).toFixed(0)} KB)</span>
                     <button
                       type="button"
                       onClick={() => {
                         setSelectedFile(null);
                         if (fileInputRef.current) fileInputRef.current.value = "";
                       }}
-                      className="ml-1 p-0.5 rounded hover:bg-error/10 text-outline-variant hover:text-error transition-colors"
+                      className="ml-1 p-1 rounded hover:bg-error/10 text-outline-variant hover:text-error transition-colors shrink-0"
+                      aria-label="Remove attached file"
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -690,10 +716,10 @@ export default function ConsolePage() {
                       dispatchPayload(e as unknown as React.FormEvent);
                     }
                   }}
-                  placeholder={selectedFile ? "Ask about the attached document..." : "Type your message... (Shift+Enter for new line)"}
+                  placeholder={selectedFile ? "Ask about the attached document..." : "Type your message..."}
                   maxLength={10000}
                   rows={1}
-                  className="w-full bg-surface-container/40 border border-outline-variant/20 rounded-xl pl-4 pr-12 py-3 text-sm text-on-surface placeholder:text-outline-variant/50 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none overflow-hidden"
+                  className="w-full bg-surface-container/40 border border-outline-variant/20 rounded-xl pl-3 sm:pl-4 pr-3 sm:pr-4 py-3 text-base sm:text-sm text-on-surface placeholder:text-outline-variant/50 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none overflow-hidden"
                   disabled={isProcessing}
                   style={{ minHeight: "44px" }}
                 />
@@ -706,7 +732,8 @@ export default function ConsolePage() {
               <button
                 type="submit"
                 disabled={isProcessing || (!input.trim() && !selectedFile)}
-                className="w-10 h-10 flex items-center justify-center rounded-xl bg-primary text-on-primary hover:bg-primary-fixed active:scale-[0.95] transition-all disabled:opacity-40 primary-glow shrink-0 mb-0.5"
+                className="w-11 h-11 flex items-center justify-center rounded-xl bg-primary text-on-primary hover:bg-primary-fixed active:scale-[0.95] transition-all disabled:opacity-40 primary-glow shrink-0 mb-0.5"
+                aria-label="Send message"
               >
                 <Send className="w-5 h-5" />
               </button>

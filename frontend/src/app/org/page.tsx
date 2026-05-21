@@ -661,7 +661,7 @@ export default function OrgPage() {
                   className="bg-surface-container-low border border-outline-variant/30 rounded px-3 py-2 text-on-surface"
                 />
               </label>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <label className="text-xs font-mono text-outline flex flex-col gap-1">
                   Card Number
                   <input

@@ -27,7 +27,7 @@ function ToastCard({ t }: { t: Toast }) {
       animate={{ opacity: 1, x: 0, scale: 1 }}
       exit={{ opacity: 0, x: 24, scale: 0.96 }}
       transition={{ duration: 0.18 }}
-      className={`pointer-events-auto flex w-full max-w-sm items-start gap-3 rounded-lg border bg-surface-container/90 backdrop-blur p-3 shadow-lg ${COLORS[t.level]}`}
+      className={`pointer-events-auto flex w-full sm:max-w-sm items-start gap-3 rounded-lg border bg-surface-container/90 backdrop-blur p-3 shadow-lg ${COLORS[t.level]}`}
     >
       <Icon className="w-4 h-4 mt-0.5 flex-shrink-0" />
       <div className="flex-1 min-w-0">
@@ -51,7 +51,9 @@ function ToastCard({ t }: { t: Toast }) {
 export default function ToastViewport() {
   const toasts = useToasts();
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-[1000] flex flex-col gap-2 max-w-sm">
+    <div
+      className="pointer-events-none fixed z-[1000] flex flex-col gap-2 bottom-[max(env(safe-area-inset-bottom),1rem)] left-4 right-4 sm:left-auto sm:right-4 sm:max-w-sm"
+    >
       <AnimatePresence>
         {toasts.map((t) => (
           <ToastCard key={t.id} t={t} />

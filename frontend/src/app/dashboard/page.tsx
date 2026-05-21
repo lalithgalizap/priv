@@ -188,7 +188,7 @@ export default function DashboardPage() {
     <AppShell>
       <div className="mb-8 flex flex-col md:flex-row justify-between items-start md:items-end gap-4">
         <div>
-          <h2 className="text-4xl md:text-5xl font-bold text-on-surface mb-2 tracking-tight">
+          <h2 className="text-3xl sm:text-4xl md:text-5xl font-bold text-on-surface mb-2 tracking-tight">
             Telemetry Overview
           </h2>
           <p className="text-on-surface-variant font-mono text-sm flex items-center gap-2">
@@ -215,7 +215,7 @@ export default function DashboardPage() {
               <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-outline uppercase mb-4 flex items-center gap-2">
                 <Building2 className="w-4 h-4 text-primary" /> Platform Overview
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                 <a href="/admin" className="glass-panel rounded-xl p-5 hover:bg-surface-container-high/30 transition-colors block">
                   <div className="flex items-center gap-2 mb-2">
                     <Building2 className="w-4 h-4 text-primary" />
@@ -248,7 +248,7 @@ export default function DashboardPage() {
               <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-outline uppercase mb-4 flex items-center gap-2">
                 <User className="w-4 h-4 text-primary" /> My Usage
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 sm:gap-6 mb-6">
                 <StatCard icon={Activity} label="My Tokens" value={personal.total_tokens.toLocaleString()} color="primary" />
                 <StatCard icon={Activity} label="My Calls" value={personal.total_calls.toLocaleString()} color="secondary" />
                 <StatCard icon={Wallet} label="My Cost" value={`$${personal.compute_cost.toFixed(2)}`} color="error" />
@@ -299,7 +299,7 @@ export default function DashboardPage() {
               <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-outline uppercase mb-4 flex items-center gap-2">
                 <Building2 className="w-4 h-4 text-tertiary" /> Company Usage
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 sm:gap-6 mb-6">
                 <StatCard icon={Activity} label="Company Tokens" value={org.total_tokens.toLocaleString()} color="primary" />
                 <StatCard icon={Users} label="Active Users" value={org.active_users.toLocaleString()} color="tertiary" />
                 <StatCard icon={Activity} label="Company Calls" value={org.total_calls.toLocaleString()} color="secondary" />
@@ -340,7 +340,7 @@ export default function DashboardPage() {
               <h3 className="font-mono text-xs font-semibold tracking-[0.1em] text-outline uppercase mb-4 flex items-center gap-2">
                 <Crown className="w-4 h-4 text-secondary" /> Global Platform Usage
               </h3>
-              <div className="grid grid-cols-1 md:grid-cols-5 gap-6 mb-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4 sm:gap-6 mb-6">
                 <StatCard icon={Activity} label="Global Tokens" value={globalData.total_tokens.toLocaleString()} color="primary" />
                 <StatCard icon={Activity} label="Global Calls" value={globalData.total_calls.toLocaleString()} color="secondary" />
                 <StatCard icon={Users} label="Active Tenants" value={globalData.active_tenants.toLocaleString()} color="tertiary" />
