@@ -112,7 +112,9 @@ export async function signUpWithPassword(
   return {
     ok: true,
     session: null,
-    user: ((obj && (obj.user as SupabaseUser)) || (obj as SupabaseUser)) as SupabaseUser,
+    user: (obj && obj.user
+      ? (obj.user as unknown as SupabaseUser)
+      : (obj as unknown as SupabaseUser)),
   };
 }
 
