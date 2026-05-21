@@ -492,7 +492,12 @@ export default function ConsolePage() {
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                {sessions.map((session) => (
+                {/* Sort newest-first by updatedAt so a session jumps to the top
+                    immediately after the user sends a message in it. */}
+                {sessions
+                  .slice()
+                  .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+                  .map((session) => (
                   <div
                     key={session.id}
                     onClick={() => handleSwitchSession(session.id)}

@@ -767,7 +767,10 @@ async def execute_upload_brokerage(
             full_prompt = f"[Document: {file.filename}]\n{doc_text}\n\n[User Question]\n{prompt}"
             logger.info(
                 "Document uploaded",
-                extra={"filename": file.filename, "char_count": len(doc_text)},
+                # `filename` collides with LogRecord's reserved attribute, so we
+                # rename to `document_name` to avoid the KeyError raised by
+                # logging.makeRecord.
+                extra={"document_name": file.filename, "char_count": len(doc_text)},
             )
 
     try:
